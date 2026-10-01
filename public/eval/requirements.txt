@@ -1,0 +1,6 @@
+pytest
+pillow
+requests
+python-dotenv
+pyyaml
+huggingface_hub

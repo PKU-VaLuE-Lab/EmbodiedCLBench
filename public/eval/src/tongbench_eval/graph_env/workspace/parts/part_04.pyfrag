@@ -1,0 +1,435 @@
+            "satisfied_preconditions": satisfied_preconditions,
+            "missing_preconditions": missing_preconditions,
+            "state_update": {
+                "previous_state_predicates": list(state_update["previous_state_predicates"]),
+                "raw_add_effects": list(state_update["raw_add_effects"]),
+                "raw_delete_effects": list(state_update["raw_delete_effects"]),
+                "add_effects": [],
+                "delete_effects": [],
+                "consistency_adds": list(state_update["consistency_adds"]),
+                "consistency_deletes": list(state_update["consistency_deletes"]),
+                "consistency_rules_applied": list(state_update["consistency_rules_applied"]),
+                "new_state_predicates": list(current_state_predicates),
+                "normalized_new_state_predicates": list(current_state_predicates),
+            },
+            "dag_alignment": dag_alignment,
+            "observation_status": current_observation_status,
+            "observation_warning": current_observation_warning,
+            "reached_goal": bool(state.get("reached_goal", False)),
+            "done": done,
+            "diagnostic": invalid_report,
+        }
+
+    if action_id is not None:
+        matching = next((action for action in actions if action["action_id"] == action_id), None)
+        if matching is not None:
+            valid = True
+            transition_status = "matched_transition"
+            matched_action_id = matching["action_id"]
+            matched_edge = next(edge for edge in _outgoing_edges(task, current_id) if str(edge.get("action", "")) == matched_action_id)
+            parsed = parse_edge_action(matched_action_id)
+            selected_action_type = parsed["action_type"]
+            selected_object_id = parsed["object_id"]
+            selected_target_id = parsed["target_id"]
+            executable_by_state = True
+            matched_transition = True
+        else:
+            matched_action_id = action_id
+            transition_status = "parse_error"
+            executable_by_state = False
+    elif action_interface == "global_factorized":
+        report = _build_global_factorized_report(
+            task=task,
+            current_id=current_id,
+            current_depth=int(current_node.get("depth", 0)),
+            current_state_predicates=current_state_predicates,
+            action_type=action_type,
+            object_id=object_id,
+            target_id=target_id,
+        )
+        selected_action_type = report["selected_action_type"]
+        selected_object_id = report["selected_object_id"]
+        selected_target_id = report["selected_target_id"]
+        transition_status = report["transition_status"]
+        executable_by_state = bool(report["executable_by_state"])
+        matched_transition = bool(report["matched_transition"])
+        if matched_transition:
+            valid = True
+            matched_edge = find_matching_transition(
+                current_node_id=current_id,
+                action_type=selected_action_type or "",
+                object_id=selected_object_id,
+                target_id=selected_target_id,
+                task=task,
+            )
+            matched_action_id = str(matched_edge.get("action", "")) if matched_edge is not None else None
+        else:
+            invalid_report = report
+            matched_action_id = None
+    else:
+        matched_edge = find_matching_transition(
+            current_node_id=current_id,
+            action_type=action_type or "",
+            object_id=object_id,
+            target_id=target_id,
+            task=task,
+        )
+        if matched_edge is not None:
+            valid = True
+            matched_action_id = str(matched_edge.get("action", ""))
+            parsed = parse_edge_action(matched_action_id)
+            selected_action_type = parsed["action_type"]
+            selected_object_id = parsed["object_id"]
+            selected_target_id = parsed["target_id"]
+            transition_status = "matched_transition"
+            executable_by_state = True
+            matched_transition = True
+        else:
+            matched_action_id = "__INVALID_FACTOR_SELECTION__"
+            invalid_report = _build_factorized_current_valid_report(
+                task=task,
+                current_id=current_id,
+                current_depth=int(current_node.get("depth", 0)),
+                current_state_predicates=current_state_predicates,
+                action_type=action_type,
+                object_id=object_id,
+                target_id=target_id,
+            )
+            selected_action_type = invalid_report["invalid_action"]["action_type"]
+            selected_object_id = invalid_report["invalid_action"]["object_id"]
+            selected_target_id = invalid_report["invalid_action"]["target_id"]
+            transition_status = "not_executable_by_state"
+            executable_by_state = False
+            matched_transition = False
+
+    next_id = str(matched_edge.get("to", current_id)) if valid and matched_edge is not None else current_id
+    next_node = nodes[next_id]
+    normalized_next_state = _normalize_state(next_node.get("state"))
+    reached_goal = _is_goal(task, next_node)
+    step_count = int(state.get("step_count", 0)) + 1
+    invalid_action_count = int(state.get("invalid_action_count", 0)) + (0 if valid else 1)
+    max_steps = int(state.get("max_steps", 30))
+    done = reached_goal or step_count >= max_steps
+
+    trace_entry = {
+        "step_index": int(state.get("step_count", 0)),
+        "observation_image_paths": _image_paths(workspace_dir, current_id),
+        "current_state_id": current_id,
+        "render_node_id": current_id,
+        "current_depth": int(current_node.get("depth", 0)),
+        "current_state_predicates": current_state_predicates,
+        "normalized_current_state_predicates": list(current_state_predicates),
+        "normalized_goal_state": _normalize_state(task.get("goal_state")),
+        "candidate_actions": actions,
+        "selected_action_id": matched_action_id,
+        "selected_action_type": selected_action_type,
+        "selected_object_id": selected_object_id,
+        "selected_target_id": selected_target_id,
+        "valid": valid,
+        "transition_status": transition_status,
+        "executable_by_state": executable_by_state,
+        "matched_transition": matched_transition,
+        "next_state_id": next_id,
+        "next_depth": int(next_node.get("depth", 0)),
+        "reached_goal": reached_goal,
+        "timestamp": _timestamp(),
+        "from_state": current_id,
+        "from_depth": int(current_node.get("depth", 0)),
+        "to_state": next_id,
+        "to_depth": int(next_node.get("depth", 0)),
+        "current_predicates": normalized_next_state,
+        "previous_invalid_action_report": previous_invalid_action_report,
+        "previous_action_report": previous_action_report,
+    }
+    if not valid:
+        trace_entry["event"] = "invalid_action"
+    if invalid_report is not None:
+        trace_entry["error_type"] = invalid_report.get("error_type")
+        if "constraint_violations" in invalid_report:
+            trace_entry["constraint_violations"] = invalid_report["constraint_violations"]
+        trace_entry["diagnostic"] = invalid_report.get("diagnostic")
+        if "precondition_violations" in invalid_report:
+            trace_entry["precondition_violations"] = invalid_report["precondition_violations"]
+    _append_trace(workspace_dir, trace_entry)
+
+    next_state = {
+        "current_state_id": next_id,
+        "render_node_id": next_id,
+        "current_depth": int(next_node.get("depth", 0)),
+        "reached_goal": reached_goal,
+        "done": done,
+        "step_count": step_count,
+        "invalid_action_count": invalid_action_count,
+        "max_steps": max_steps,
+        "current_state_predicates": normalized_next_state,
+        "image_paths": _image_paths(workspace_dir, next_id),
+        "observation_status": "rendered_node_observation",
+        "observation_warning": None,
+        "previous_invalid_action_report": None if valid or action_interface == "global_factorized" else invalid_report,
+        "previous_action_report": None if valid or action_interface != "global_factorized" else {
+            "action_type": selected_action_type,
+            "object_id": selected_object_id,
+            "target_id": selected_target_id,
+            "executable_by_state": executable_by_state,
+            "matched_transition": matched_transition,
+            "transition_status": transition_status,
+            "precondition_violations": list((invalid_report or {}).get("precondition_violations", [])),
+            "diagnostic_reason": (invalid_report or {}).get("diagnostic", {}).get("reason"),
+        },
+    }
+    _save_env_state(workspace_dir, next_state)
+    result = {
+        "valid": valid,
+        "transition_status": transition_status,
+        "from_state": current_id,
+        "to_state": next_id,
+        "render_node_id": next_id if valid else (current_render_node_id if not bool(state.get("is_virtual_state", False)) else None),
+        "selected_action_id": matched_action_id,
+        "selected_action_type": selected_action_type,
+        "selected_object_id": selected_object_id,
+        "selected_target_id": selected_target_id,
+        "executable_by_state": executable_by_state,
+        "matched_transition": matched_transition,
+        "reached_goal": reached_goal,
+        "done": done,
+    }
+    if invalid_report is not None:
+        result["diagnostic"] = invalid_report.get("diagnostic")
+        result.update(
+            {
+                key: value
+                for key, value in invalid_report.items()
+                if key not in {"valid", "selected_action_type", "selected_object_id", "selected_target_id"}
+            }
+        )
+    return result
+
+def _act(
+    workspace_dir: Path,
+    action_id: str | None = None,
+    action_level: str | None = None,
+    template_id: str | None = None,
+    action_type: str | None = None,
+    object_id: str | None = None,
+    target_id: str | None = None,
+    role_bindings: dict[str, str] | None = None,
+    parse_error: str | None = None,
+    raw_response: str | None = None,
+    parsed_json: dict[str, Any] | None = None,
+    parse_error_details: dict[str, Any] | None = None,
+    action_interface: str = "full_action",
+    action_library_mode: str = "atomic_only",
+    atomic_template_path: str | None = None,
+    subtask_template_path: str | None = None,
+    exclusive_in_view: bool = True,
+) -> dict[str, Any]:
+    return _apply_step(
+        workspace_dir,
+        action_id=action_id,
+        action_level=action_level,
+        template_id=template_id,
+        action_type=action_type,
+        object_id=object_id,
+        target_id=target_id,
+        role_bindings=role_bindings,
+        parse_error=parse_error,
+        raw_response=raw_response,
+        parsed_json=parsed_json,
+        parse_error_details=parse_error_details,
+        action_interface=action_interface,
+        action_library_mode=action_library_mode,
+        atomic_template_path=atomic_template_path,
+        subtask_template_path=subtask_template_path,
+        exclusive_in_view=exclusive_in_view,
+    )
+
+
+def _status(workspace_dir: Path) -> dict[str, Any]:
+    task = _load_task(workspace_dir)
+    state = _load_env_state(workspace_dir, task)
+    reached_goal = bool(state["reached_goal"])
+    step_count = int(state["step_count"])
+    max_steps = int(state.get("max_steps", 30))
+    done = bool(state.get("done", False)) or reached_goal or step_count >= max_steps
+    if done != bool(state.get("done", False)):
+        state["done"] = done
+        _save_env_state(workspace_dir, state)
+    return {
+        "current_state_id": state["current_state_id"],
+        "render_node_id": state.get("render_node_id"),
+        "current_depth": state["current_depth"],
+        "reached_goal": reached_goal,
+        "done": done,
+        "step_count": step_count,
+        "invalid_action_count": int(state["invalid_action_count"]),
+        "max_steps": max_steps,
+    }
+
+
+def _finish(workspace_dir: Path) -> dict[str, Any]:
+    task = _load_task(workspace_dir)
+    state = _load_env_state(workspace_dir, task)
+    reached_goal = bool(state["reached_goal"])
+    step_count = int(state["step_count"])
+    invalid_action_count = int(state["invalid_action_count"])
+    max_steps = int(state.get("max_steps", 30))
+    done = bool(state["done"]) or reached_goal or step_count >= max_steps
+    premature_finish = not done and not reached_goal
+    if premature_finish:
+        current_id = str(state["current_state_id"])
+        step_count += 1
+        invalid_action_count += 1
+        done = step_count >= max_steps
+        invalid_report = {
+            "error_type": "premature_finish",
+            "diagnostic": {
+                "reason": "finish was called before the task goal was reached",
+            },
+        }
+        _append_trace(
+            workspace_dir,
+            {
+                "step_index": int(state.get("step_count", 0)),
+                "event": "invalid_finish",
+                "observation_image_paths": _image_paths(workspace_dir, current_id),
+                "current_state_id": current_id,
+                "render_node_id": state.get("render_node_id"),
+                "current_depth": int(state.get("current_depth", 0)),
+                "current_state_predicates": _normalize_state(state.get("current_state_predicates", [])),
+                "normalized_current_state_predicates": _normalize_state(state.get("current_state_predicates", [])),
+                "normalized_goal_state": _normalize_state(task.get("goal_state")),
+                "candidate_actions": [],
+                "selected_action_id": "__PREMATURE_FINISH__",
+                "selected_action_type": "finish",
+                "selected_object_id": "",
+                "selected_target_id": "",
+                "valid": False,
+                "transition_status": "premature_finish",
+                "executable_by_state": False,
+                "matched_transition": False,
+                "next_state_id": current_id,
+                "next_depth": int(state.get("current_depth", 0)),
+                "reached_goal": reached_goal,
+                "timestamp": _timestamp(),
+                "from_state": current_id,
+                "from_depth": int(state.get("current_depth", 0)),
+                "to_state": current_id,
+                "to_depth": int(state.get("current_depth", 0)),
+                "current_predicates": _normalize_state(state.get("current_state_predicates", [])),
+                "previous_invalid_action_report": state.get("previous_invalid_action_report"),
+                "previous_action_report": state.get("previous_action_report"),
+                "error_type": "premature_finish",
+                "diagnostic": invalid_report["diagnostic"],
+            },
+        )
+        state.update(
+            {
+                "done": done,
+                "step_count": step_count,
+                "invalid_action_count": invalid_action_count,
+                "previous_invalid_action_report": invalid_report,
+            },
+        )
+        _save_env_state(workspace_dir, state)
+    elif done != bool(state.get("done", False)):
+        state["done"] = done
+        _save_env_state(workspace_dir, state)
+    final_state = {
+        "task_id": str(task.get("task_id", workspace_dir.name)),
+        "current_state_id": state["current_state_id"],
+        "render_node_id": state.get("render_node_id"),
+        "current_depth": state["current_depth"],
+        "reached_goal": reached_goal,
+        "done": done,
+        "step_count": step_count,
+        "invalid_action_count": invalid_action_count,
+        "premature_finish": premature_finish,
+        "current_state_predicates": _normalize_state(state.get("current_state_predicates", [])),
+    }
+    results_dir = _results_dir(workspace_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    (results_dir / "final_state.json").write_text(json.dumps(final_state, indent=2), encoding="utf-8")
+    return final_state
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Standalone TongSIM workspace environment")
+    parser.add_argument("--workspace-dir")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    observe_parser = subparsers.add_parser("observe")
+    observe_parser.add_argument("--action-interface", choices=["full_action", "factorized", "global_factorized", "library_factorized"], default="full_action")
+    observe_parser.add_argument("--action-library-mode", choices=["atomic_only", "subtask_only", "atomic_plus_subtask"], default="atomic_only")
+    observe_parser.add_argument("--atomic-template-path")
+    observe_parser.add_argument("--subtask-template-path")
+    observe_parser.add_argument("--exclusive-in-view", choices=["true", "false"], default="true")
+    observe_parser.add_argument("--debug-expose-valid-bindings", action="store_true")
+    act_parser = subparsers.add_parser("act")
+    act_parser.add_argument("--action-interface", choices=["full_action", "factorized", "global_factorized", "library_factorized"], default="full_action")
+    act_parser.add_argument("--action-library-mode", choices=["atomic_only", "subtask_only", "atomic_plus_subtask"], default="atomic_only")
+    act_parser.add_argument("--atomic-template-path")
+    act_parser.add_argument("--subtask-template-path")
+    act_parser.add_argument("--exclusive-in-view", choices=["true", "false"], default="true")
+    act_parser.add_argument("--action_id")
+    act_parser.add_argument("--action_level")
+    act_parser.add_argument("--template_id")
+    act_parser.add_argument("--action_type")
+    act_parser.add_argument("--object_id")
+    act_parser.add_argument("--target_id")
+    act_parser.add_argument("--role_bindings")
+    act_parser.add_argument("--parse-error")
+    act_parser.add_argument("--raw-response")
+    act_parser.add_argument("--parsed-json")
+    act_parser.add_argument("--parse-error-details")
+    subparsers.add_parser("status")
+    subparsers.add_parser("finish")
+    args = parser.parse_args()
+
+    workspace_dir = _workspace_dir(args.workspace_dir)
+    task = _load_task(workspace_dir)
+    state = _load_env_state(workspace_dir, task)
+
+    if args.command == "observe":
+        payload = _observe_payload_with_interface(
+            workspace_dir,
+            task,
+            state,
+            action_interface=args.action_interface,
+            debug_expose_valid_bindings=bool(args.debug_expose_valid_bindings),
+            action_library_mode=args.action_library_mode,
+            atomic_template_path=args.atomic_template_path,
+            subtask_template_path=args.subtask_template_path,
+        )
+    elif args.command == "act":
+        parsed_role_bindings = json.loads(args.role_bindings) if args.role_bindings else None
+        parsed_json_payload = json.loads(args.parsed_json) if args.parsed_json else None
+        parsed_error_details = json.loads(args.parse_error_details) if args.parse_error_details else None
+        payload = _act(
+            workspace_dir,
+            action_id=args.action_id,
+            action_level=args.action_level,
+            template_id=args.template_id,
+            action_type=args.action_type,
+            object_id=args.object_id,
+            target_id=args.target_id,
+            role_bindings=parsed_role_bindings,
+            parse_error=args.parse_error,
+            raw_response=args.raw_response,
+            parsed_json=parsed_json_payload,
+            parse_error_details=parsed_error_details,
+            action_interface=args.action_interface,
+            action_library_mode=args.action_library_mode,
+            atomic_template_path=args.atomic_template_path,
+            subtask_template_path=args.subtask_template_path,
+            exclusive_in_view=str(args.exclusive_in_view).lower() == "true",
+        )
+    elif args.command == "status":
+        payload = _status(workspace_dir)
+    else:
+        payload = _finish(workspace_dir)
+
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

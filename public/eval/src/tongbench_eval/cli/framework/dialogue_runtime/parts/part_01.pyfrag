@@ -1,0 +1,1080 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[5]
+SRC = ROOT / "src"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from tongbench_eval.agents.base import AgentCheckpoint, AgentExecution, AgentTaskSpec
+from tongbench_eval.cli.framework.protocol import (
+    LEGACY_MCP_TOOL_NAMES,
+    SAFE_CHOICE_MCP_TOOL_NAMES,
+    build_protocol_manifest,
+    claudecode_allowed_tools,
+    codex_mcp_servers,
+    mcp_image_env,
+    protocol_tool_names,
+)
+from tongbench_eval.graph_env.framework_runtime import FrameworkSession, TongSimFrameworkRuntime
+from tongbench_eval.graph_env.loader import load_tongsim_task
+from tongbench_eval.graph_env.predicate_normalizer import normalize_predicate_set
+from tongbench_eval.utils.native_runtime import (
+    activate_runtime,
+    is_native_runtime,
+    native_bundle_root,
+    native_path,
+)
+from tongbench_eval.utils.python_utils import current_python
+
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+UPDATED_ATOMIC_TEMPLATE_NAME = "atomic_templates_updated_env_v3.json"
+UPDATED_SUBTASK_TEMPLATE_NAME = "subtask_templates_compressed_updated_env_v3.json"
+
+
+def _resolve_native_mcp_python() -> str:
+    configured = os.environ.get("TONGBENCH_NATIVE_MCP_PYTHON", "").strip()
+    if configured:
+        return configured
+    bundle_root = native_bundle_root()
+    bundled_python = (
+        bundle_root / "hermes" / ".venv" / "bin" / "python3"
+        if bundle_root is not None
+        else None
+    )
+    if bundled_python is not None and bundled_python.is_file():
+        # The native bundle owns the MCP dependencies used by all harnesses.
+        # The evaluation Python may not include the `mcp` package.
+        return str(bundled_python)
+    return current_python()
+CODEX_OUTER_RETRY_ERROR_MARKERS = (
+    (
+        "codex_stream_disconnected_before_completion",
+        (
+            "stream disconnected before completion",
+            "stream closed before response.completed",
+        ),
+    ),
+    (
+        "codex_provider_429_too_many_requests",
+        (
+            "429 too many requests",
+            "last status: 429",
+        ),
+    ),
+)
+
+
+@dataclass
+class DialogueStep:
+    index: int
+    task_id: str
+    level: str
+    graph_path: Path
+    unique_state_image_dir: Path
+    max_steps: int
+    server_name: str
+    workspace_name: str
+    output_dir: Path
+    session: FrameworkSession | None = None
+
+
+def _allow_container_bridge_writes(bridge_dir: Path) -> None:
+    for path in (
+        bridge_dir,
+        bridge_dir / "requests",
+        bridge_dir / "responses",
+        bridge_dir / "current_observation",
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o777)
+
+
+def _nativeize_mcp_paths(payload: Any, task_id: str) -> Any:
+    """Translate container-only MCP paths when the agent runs on the host."""
+    if isinstance(payload, dict):
+        return {key: _nativeize_mcp_paths(value, task_id) for key, value in payload.items()}
+    if isinstance(payload, list):
+        return [_nativeize_mcp_paths(value, task_id) for value in payload]
+    if isinstance(payload, str) and payload.startswith("/tmp_workspace"):
+        return native_path(task_id, payload)
+    return payload
+
+
+def _read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_models_config(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    raw_config = path.read_text(encoding="utf-8")
+    expanded = re.sub(
+        r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}",
+        lambda match: os.environ.get(match.group(1), ""),
+        raw_config,
+    )
+    parsed = json.loads(expanded)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Models config must be a JSON object: {path}")
+    return parsed
+
+
+def _apply_provider_overrides(
+    models_config: dict[str, Any] | None,
+    *,
+    model: str,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> dict[str, Any] | None:
+    if not api_key and not base_url:
+        return models_config
+    config = dict(models_config or {})
+    providers = dict(config.get("providers", {}) or {})
+    target_name = ""
+    target_provider: dict[str, Any] | None = None
+    for provider_name, provider in providers.items():
+        if not isinstance(provider, dict):
+            continue
+        for item in provider.get("models", []) or []:
+            if isinstance(item, dict) and item.get("id") == model:
+                target_name = str(provider_name)
+                target_provider = dict(provider)
+                break
+        if target_provider is not None:
+            break
+    if target_provider is None:
+        target_name = "dashscope" if "dashscope.aliyuncs.com" in str(base_url or "").lower() else "cli-override"
+        target_provider = {"models": [{"id": model, "name": model}]}
+    if api_key:
+        target_provider["apiKey"] = api_key
+    if base_url:
+        target_provider["baseUrl"] = base_url
+    providers[target_name] = target_provider
+    config["providers"] = providers
+    return config
+
+
+def _safe_slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_]+", "_", value.strip())
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    return slug or "task"
+
+
+def _task_level(task_id: str, fallback: str = "") -> str:
+    match = re.search(r"task_(L\d+)_", task_id)
+    if match:
+        return match.group(1)
+    return fallback or "L?"
+
+
+def _infer_results_root(ready_json: Path, explicit_root: str | None) -> Path:
+    if explicit_root:
+        return Path(explicit_root).resolve()
+    ready_json = ready_json.resolve()
+    if ready_json.parent.name == "l2_l3_image_reuse":
+        return ready_json.parent.parent
+    if ready_json.parent.name == "image_reuse":
+        return ready_json.parent
+    return ready_json.parent
+
+
+def _template_search_dirs(results_root: Path | None = None) -> list[Path]:
+    seeds = [ROOT, ROOT.parent]
+    if results_root is not None:
+        seeds.extend([results_root, results_root.parent])
+    candidates: list[Path] = []
+    for seed in seeds:
+        candidates.extend(
+            [
+                seed / "outputs",
+                seed / "TongBench" / "outputs",
+                seed / "Tongbench" / "outputs",
+            ]
+        )
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(str(candidate.resolve()))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def _is_legacy_fixture_template_path(path: Path) -> bool:
+    parts = {part.lower() for part in path.parts}
+    return "tests" in parts and "fixtures" in parts and path.name.lower() in {
+        "atomic_templates.json",
+        "subtask_templates.json",
+    }
+
+
+def _resolve_default_template_path(
+    raw_path: str | None,
+    env_var: str,
+    filename: str,
+    results_root: Path | None = None,
+) -> Path | None:
+    explicit_path = Path(raw_path).resolve() if raw_path else None
+    if explicit_path is not None and not _is_legacy_fixture_template_path(explicit_path):
+        return explicit_path
+    env_value = os.environ.get(env_var)
+    if env_value:
+        return Path(env_value).resolve()
+    for directory in _template_search_dirs(results_root):
+        candidate = directory / filename
+        if candidate.exists():
+            return candidate.resolve()
+    return explicit_path
+
+
+def _load_ready_items(ready_json: Path) -> list[dict[str, Any]]:
+    payload = _read_json(ready_json)
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("tasks", "ready_tasks", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    raise ValueError(f"Unsupported ready task JSON structure: {ready_json}")
+
+
+_READY_ITEMS_CACHE: dict[str, list[dict[str, Any]]] = {}
+
+
+def _cached_ready_items(ready_json: str | Path) -> list[dict[str, Any]]:
+    path = Path(ready_json).resolve()
+    key = str(path)
+    if key not in _READY_ITEMS_CACHE:
+        _READY_ITEMS_CACHE[key] = _load_ready_items(path)
+    return _READY_ITEMS_CACHE[key]
+
+
+def _graph_path_for_task(results_root: Path, task_id: str) -> Path:
+    candidates = [
+        _task_root(results_root, task_id) / "input" / f"{task_id}_atomic_expanded_graph.json",
+        _task_root(results_root, task_id) / f"{task_id}_atomic_expanded_graph.json",
+    ]
+    if _task_level(task_id) == "L1":
+        candidates.append(results_root / "graph" / f"{task_id}_atomic_expanded_graph.json")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _task_root(results_root: Path, task_id: str) -> Path:
+    candidates = [
+        results_root / "tasks" / task_id,
+        results_root / "l2_l3_image_reuse" / "tasks" / task_id,
+        results_root / "image_reuse" / "tasks" / task_id,
+        results_root / task_id,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _composite_task_root(results_root: Path, task_id: str) -> Path:
+    return _task_root(results_root, task_id)
+
+
+def _unique_states_json_for_task(results_root: Path, task_id: str) -> Path:
+    task_root = _task_root(results_root, task_id)
+    candidates = [
+        task_root / "input" / f"{task_id}_unique_states.json",
+        task_root / f"{task_id}_unique_states.json",
+    ]
+    if _task_level(task_id) == "L1":
+        candidates.append(results_root / "graph" / f"{task_id}_unique_states.json")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Missing unique states JSON for {task_id}: {candidates[0]}")
+
+
+def _unique_states_json_for_composite(results_root: Path, task_id: str) -> Path:
+    return _unique_states_json_for_task(results_root, task_id)
+
+
+def _source_image_dir_for_task(results_root: Path, task_id: str) -> Path:
+    task_root = _task_root(results_root, task_id)
+    candidates = [
+        task_root / "output" / f"{task_id}_unique_states",
+        task_root / f"{task_id}_unique_states",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Missing unique-state image dir for {task_id}: {candidates[0]}")
+
+
+def _source_image_dir_for_composite(results_root: Path, task_id: str) -> Path:
+    return _source_image_dir_for_task(results_root, task_id)
+
+
+def _image_files_in_dir(directory: Path) -> list[Path]:
+    if not directory.is_dir():
+        return []
+    return sorted(path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+
+
+def _find_state_image_dir(root: Path, state_id: str, index: int | None = None) -> Path | None:
+    if index is not None:
+        candidate = root / f"{int(index):03d}_{state_id}"
+        if candidate.is_dir():
+            return candidate
+    direct = root / state_id
+    if direct.is_dir():
+        return direct
+    matches = sorted(path for path in root.glob(f"*_{state_id}") if path.is_dir())
+    return matches[0] if matches else None
+
+
+def _state_predicates(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        for key in ("predicates", "state", "target_state", "source_state"):
+            if isinstance(value.get(key), list):
+                return [str(item) for item in value.get(key, [])]
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return []
+
+
+def _state_signature(predicates: Any) -> tuple[str, ...]:
+    return tuple(sorted(normalize_predicate_set(_state_predicates(predicates))))
+
+
+def _resolve_manifest_path(raw_path: Any, results_root: Path) -> Path | None:
+    raw = str(raw_path or "").strip()
+    if not raw:
+        return None
+    direct = Path(raw)
+    if direct.exists():
+        return direct.resolve()
+    if not direct.is_absolute():
+        candidate = results_root / direct
+        if candidate.exists():
+            return candidate.resolve()
+        task_root_candidate = results_root.parent / direct
+        if task_root_candidate.exists():
+            return task_root_candidate.resolve()
+    normalized = raw.replace("\\", "/")
+    anchor = f"/{results_root.name}/"
+    index = normalized.find(anchor)
+    if index >= 0:
+        relative = normalized[index + len(anchor) :].lstrip("/")
+        candidate = results_root / Path(*relative.split("/"))
+        if candidate.exists():
+            return candidate.resolve()
+    for marker in ("l2_l3_image_reuse/", "image_reuse/", "graph/"):
+        index = normalized.find(marker)
+        if index >= 0:
+            relative = normalized[index:].lstrip("/")
+            candidate = results_root / Path(*relative.split("/"))
+            if candidate.exists():
+                return candidate.resolve()
+    return None
+
+
+def _manifest_image_dir(state: dict[str, Any], results_root: Path) -> Path | None:
+    for key in ("copied_image_path", "reused_image_path"):
+        image_path = _resolve_manifest_path(state.get(key), results_root)
+        if image_path is not None and image_path.is_file():
+            return image_path.parent
+    for raw_path in state.get("source_image_paths", []) or []:
+        image_path = _resolve_manifest_path(raw_path, results_root)
+        if image_path is not None and image_path.is_file():
+            return image_path.parent
+    return None
+
+
+def _composite_manifest_states(results_root: Path, task_id: str) -> list[dict[str, Any]]:
+    task_root = _composite_task_root(results_root, task_id)
+    manifest_path = task_root / "task_image_manifest.json"
+    if manifest_path.exists():
+        payload = _read_json(manifest_path)
+        raw_states = payload.get("states", []) if isinstance(payload, dict) else []
+        try:
+            image_root: Path | None = _source_image_dir_for_composite(results_root, task_id)
+        except FileNotFoundError:
+            image_root = None
+    else:
+        image_root = _source_image_dir_for_composite(results_root, task_id)
+        payload = _read_json(_unique_states_json_for_composite(results_root, task_id))
+        raw_states = payload.get("states", []) if isinstance(payload, dict) else []
+
+    states: list[dict[str, Any]] = []
+    for index, state in enumerate(item for item in raw_states if isinstance(item, dict)):
+        state_id = str(state.get("target_state_id") or state.get("state_id") or "").strip()
+        target_state = _state_predicates(state.get("target_state", state.get("state", [])))
+        image_dir = _manifest_image_dir(state, results_root)
+        if image_dir is None and state_id:
+            image_dir = _find_state_image_dir(image_root, state_id, index) if image_root is not None else None
+        if image_dir is None or not _image_files_in_dir(image_dir):
+            continue
+        states.append(
+            {
+                "index": index,
+                "state_id": state_id or f"state_{index:04d}",
+                "target_state": target_state,
+                "target_signature": set(_state_signature(target_state)),
+                "source_task_id": str(state.get("source_task_id") or "").strip(),
+                "source_state_id": str(state.get("source_state_id") or "").strip(),
+                "source_state": _state_predicates(state.get("source_state", [])),
+                "source_signature": set(_state_signature(state.get("source_state", []))),
+                "component_source_l1_task_ids": [
+                    str(task_id).strip()
+                    for task_id in state.get("component_source_l1_task_ids", []) or []
+                    if str(task_id).strip()
+                ],
+                "image_dir": str(image_dir.resolve()),
+                "match_type": state.get("match_type"),
+            }
+        )
+    if not states:
+        raise FileNotFoundError(f"No usable image states found for {task_id} under {image_root}")
+    return states
+
+
+def _prepare_composite_image_manifest(
+    *,
+    results_root: Path,
+    task_id: str,
+    stage_dir: Path,
+) -> Path:
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    states_payload = _read_json(_unique_states_json_for_composite(results_root, task_id))
+    source_image_dir = _source_image_dir_for_composite(results_root, task_id)
+    raw_states = states_payload.get("states", []) if isinstance(states_payload, dict) else []
+
+    nodes: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    for index, state in enumerate(item for item in raw_states if isinstance(item, dict)):
+        state_id = str(state.get("state_id") or state.get("target_state_id") or f"state_{index:04d}").strip()
+        image_dir = _find_state_image_dir(source_image_dir, state_id, index)
+        predicates = _state_predicates(state.get("state", state.get("target_state", [])))
+        if image_dir is None or not _image_files_in_dir(image_dir):
+            missing.append({"state_id": state_id, "index": index})
+            continue
+        nodes.append(
+            {
+                "node_id": str(state.get("atomic_expanded_node_id") or state.get("node_id") or state_id),
+                "node_index": index,
+                "state_id": state_id,
+                "state": predicates,
+                "_image_dir": str(image_dir.resolve()),
+            }
+        )
+
+    _write_json(
+        stage_dir / "node_manifest.json",
+        {
+            "task_id": task_id,
+            "source_unique_state_image_dir": str(source_image_dir.resolve()),
+            "nodes": nodes,
+        },
+    )
+    _write_json(
+        stage_dir / "image_mapping_report.json",
+        {
+            "task_id": task_id,
+            "source_unique_state_image_dir": str(source_image_dir.resolve()),
+            "mapped": nodes,
+            "missing": missing,
+        },
+    )
+    if not nodes:
+        raise FileNotFoundError(f"No composite images mapped for {task_id}")
+    return stage_dir
+
+
+def _prepare_direct_task_image_manifest(
+    *,
+    results_root: Path,
+    task_id: str,
+    stage_dir: Path,
+) -> Path:
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    task_root = _composite_task_root(results_root, task_id)
+    manifest_path = task_root / "task_image_manifest.json"
+    if manifest_path.exists():
+        states_payload = _read_json(manifest_path)
+        try:
+            source_image_dir: Path | None = _source_image_dir_for_task(results_root, task_id)
+        except FileNotFoundError:
+            source_image_dir = None
+    else:
+        states_payload = _read_json(_unique_states_json_for_task(results_root, task_id))
+        source_image_dir = _source_image_dir_for_task(results_root, task_id)
+    raw_states = states_payload.get("states", []) if isinstance(states_payload, dict) else []
+
+    nodes: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    for index, state in enumerate(item for item in raw_states if isinstance(item, dict)):
+        state_id = str(state.get("state_id") or state.get("target_state_id") or f"state_{index:04d}").strip()
+        image_dir = _manifest_image_dir(state, results_root)
+        if image_dir is None:
+            image_dir = _find_state_image_dir(source_image_dir, state_id, index) if source_image_dir is not None else None
+        predicates = _state_predicates(state.get("state", state.get("target_state", [])))
+        if image_dir is None or not _image_files_in_dir(image_dir):
+            missing.append({"state_id": state_id, "index": index})
+            continue
+        nodes.append(
+            {
+                "node_id": str(state.get("atomic_expanded_node_id") or state.get("node_id") or state_id),
+                "node_index": index,
+                "state_id": state_id,
+                "state": predicates,
+                "_image_dir": str(image_dir.resolve()),
+            }
+        )
+
+    _write_json(
+        stage_dir / "node_manifest.json",
+        {
+            "task_id": task_id,
+            "source_unique_state_image_dir": str(source_image_dir.resolve()) if source_image_dir is not None else None,
+            "nodes": nodes,
+        },
+    )
+    _write_json(
+        stage_dir / "image_mapping_report.json",
+        {
+            "task_id": task_id,
+            "source_unique_state_image_dir": str(source_image_dir.resolve()) if source_image_dir is not None else None,
+            "mapped": nodes,
+            "missing": missing,
+        },
+    )
+    if not nodes:
+        raise FileNotFoundError(f"No images mapped for {task_id}")
+    return stage_dir
+
+
+def _match_l1_state(
+    *,
+    l1_task_id: str,
+    l1_signature: set[str],
+    composite_states: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    candidates: list[tuple[int, int, str, dict[str, Any]]] = []
+    for state in composite_states:
+        target_signature = set(state.get("target_signature", set()))
+        source_signature = set(state.get("source_signature", set()))
+        source_task_id = str(state.get("source_task_id") or "")
+        component_ids = set(state.get("component_source_l1_task_ids", []) or [])
+
+        priority: int | None = None
+        comparison_signature: set[str] = target_signature
+        if source_task_id == l1_task_id and l1_signature == source_signature:
+            priority = 0
+            comparison_signature = source_signature
+        elif source_task_id == l1_task_id and l1_signature.issubset(source_signature):
+            priority = 1
+            comparison_signature = source_signature
+        elif source_task_id == l1_task_id and l1_signature.issubset(target_signature):
+            priority = 2
+            comparison_signature = target_signature
+        elif l1_task_id in component_ids and l1_signature.issubset(target_signature):
+            priority = 3
+            comparison_signature = target_signature
+        elif l1_signature.issubset(target_signature):
+            priority = 4
+            comparison_signature = target_signature
+
+        if priority is None:
+            continue
+        extra_predicate_count = len(comparison_signature - l1_signature)
+        candidates.append((priority, extra_predicate_count, str(state.get("state_id") or ""), state))
+
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: (item[0], item[1], item[2]))[0][3]
+
+
+def _prepare_l1_image_manifest(
+    *,
+    l1_graph_path: Path,
+    l1_task_id: str,
+    composite_task_id: str,
+    composite_states: list[dict[str, Any]],
+    stage_dir: Path,
+) -> Path:
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    task = load_tongsim_task(l1_graph_path)
+
+    nodes: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    for node_index, node in enumerate(task.nodes):
+        predicates = [str(item) for item in list(node.state)]
+        signature = set(_state_signature(predicates))
+        match = _match_l1_state(
+            l1_task_id=l1_task_id,
+            l1_signature=signature,
+            composite_states=composite_states,
+        )
+        if match is None:
+            missing.append({"node_id": node.id, "node_index": node_index, "state": predicates})
+            continue
+        nodes.append(
+            {
+                "node_id": node.id,
+                "node_index": node_index,
+                "state": predicates,
+                "_image_dir": str(match["image_dir"]),
+                "matched_composite_task_id": composite_task_id,
+                "matched_composite_state_id": match.get("state_id"),
+                "matched_source_task_id": match.get("source_task_id"),
+                "matched_source_state_id": match.get("source_state_id"),
+                "match_type": match.get("match_type"),
+            }
+        )
+
+    _write_json(
+        stage_dir / "node_manifest.json",
+        {
+            "task_id": l1_task_id,
+            "source_composite_task_id": composite_task_id,
+            "nodes": nodes,
+        },
+    )
+    _write_json(stage_dir / "image_mapping_report.json", {"task_id": l1_task_id, "mapped": nodes, "missing": missing})
+    if not nodes:
+        raise FileNotFoundError(f"No L1 images mapped for {l1_task_id} from {composite_task_id}")
+    return stage_dir
+
+
+def _component_l1_ids(item: dict[str, Any]) -> list[str]:
+    component_sources = item.get("component_sources") if isinstance(item.get("component_sources"), dict) else {}
+    raw_ids = component_sources.get("mapped_source_l1_task_ids") or []
+    return [str(task_id).strip() for task_id in raw_ids if str(task_id).strip()]
+
+
+def _learning_task_ids(args: argparse.Namespace, target_task_id: str = "") -> list[str]:
+    explicit = [str(task_id).strip() for task_id in getattr(args, "learning_task_id", []) if str(task_id).strip()]
+    if explicit or not target_task_id:
+        return explicit
+    plan_path = str(getattr(args, "learning_plan_json", "") or "").strip()
+    if not plan_path:
+        return []
+    payload = _read_json(Path(plan_path).expanduser().resolve())
+    targets = payload.get("targets", []) if isinstance(payload, dict) else []
+    for record in targets:
+        if not isinstance(record, dict) or str(record.get("target_task_id") or "") != target_task_id:
+            continue
+        ids = record.get("learning_task_ids") or record.get("icl_learning_task_ids") or []
+        return [str(task_id).strip() for task_id in ids if str(task_id).strip()]
+    raise KeyError(f"Learning plan has no record for target task: {target_task_id}")
+
+
+def _learning_plan_record(args: argparse.Namespace, target_task_id: str = "") -> dict[str, Any] | None:
+    plan_path = str(getattr(args, "learning_plan_json", "") or "").strip()
+    if not plan_path or not target_task_id:
+        return None
+    payload = _read_json(Path(plan_path).expanduser().resolve())
+    targets = payload.get("targets", []) if isinstance(payload, dict) else []
+    for record in targets:
+        if isinstance(record, dict) and str(record.get("target_task_id") or "") == target_task_id:
+            return record
+    return None
+
+
+def _learning_group_id(args: argparse.Namespace, target_task_id: str = "") -> str:
+    record = _learning_plan_record(args, target_task_id)
+    if record:
+        group_id = str(record.get("learning_group_id") or record.get("shared_learning_group_id") or "").strip()
+        if group_id:
+            return group_id
+    return target_task_id
+
+
+def _scene_id(item: dict[str, Any]) -> str:
+    scene = item.get("scene_id")
+    if not scene and isinstance(item.get("task"), dict):
+        scene = item["task"].get("scene_id")
+    return str(scene or "").strip()
+
+
+def _related_l3_selection_for_l6(
+    item: dict[str, Any],
+    *,
+    ready_json: str | Path | None,
+    max_count: int,
+) -> dict[str, Any]:
+    target_task_id = str(item.get("task_id") or "").strip()
+    target_scene = _scene_id(item)
+    target_l1_ids = _component_l1_ids(item)
+    target_l1_set = set(target_l1_ids)
+    limit = max(0, int(max_count or 0))
+    selection: dict[str, Any] = {
+        "target_task_id": target_task_id,
+        "target_scene_id": target_scene,
+        "target_l1_task_ids": target_l1_ids,
+        "ready_json": str(ready_json or ""),
+        "max_count": limit,
+        "selected_task_ids": [],
+        "direct_candidate_count": 0,
+        "overlap_candidate_count": 0,
+        "selection_policy": "same_scene_direct_l1_subset_then_overlap_fill",
+    }
+    if not ready_json or limit <= 0 or not target_l1_set:
+        return selection
+
+    direct: list[dict[str, Any]] = []
+    overlap: list[dict[str, Any]] = []
+    for index, candidate in enumerate(_cached_ready_items(ready_json)):
+        task_id = str(candidate.get("task_id") or "").strip()
+        if not task_id or task_id == target_task_id:
+            continue
+        if _task_level(task_id) != "L3":
+            continue
+        if target_scene and _scene_id(candidate) != target_scene:
+            continue
+        candidate_l1_ids = _component_l1_ids(candidate)
+        candidate_l1_set = set(candidate_l1_ids)
+        if not candidate_l1_set:
+            continue
+        intersection = candidate_l1_set & target_l1_set
+        if not intersection:
+            continue
+        record = {
+            "task_id": task_id,
+            "source_l1_task_ids": candidate_l1_ids,
+            "overlap_count": len(intersection),
+            "unrelated_count": len(candidate_l1_set - target_l1_set),
+            "input_order": index,
+        }
+        if candidate_l1_set.issubset(target_l1_set):
+            direct.append(record)
+        else:
+            overlap.append(record)
+
+    selection["direct_candidate_count"] = len(direct)
+    selection["overlap_candidate_count"] = len(overlap)
+
+    selected: list[dict[str, Any]] = []
+    covered: set[str] = set()
+    remaining = list(direct)
+    while remaining and len(selected) < limit:
+        remaining.sort(
+            key=lambda record: (
+                -len(set(record["source_l1_task_ids"]) - covered),
+                -int(record["overlap_count"]),
+                int(record["input_order"]),
+            )
+        )
+        chosen = remaining.pop(0)
+        selected.append(chosen)
+        covered.update(chosen["source_l1_task_ids"])
+        remaining = [record for record in remaining if record["task_id"] != chosen["task_id"]]
+
+    if len(selected) < limit:
+        selected_ids = {record["task_id"] for record in selected}
+        fill = [record for record in overlap if record["task_id"] not in selected_ids]
+        fill.sort(key=lambda record: (-int(record["overlap_count"]), int(record["unrelated_count"]), int(record["input_order"])))
+        selected.extend(fill[: limit - len(selected)])
+
+    selection["selected_task_ids"] = [record["task_id"] for record in selected]
+    selection["selected_records"] = selected
+    selection["covered_l1_task_ids"] = sorted({l1 for record in selected for l1 in record["source_l1_task_ids"] if l1 in target_l1_set})
+    selection["covered_l1_count"] = len(selection["covered_l1_task_ids"])
+    return selection
+
+
+def _shortest_success_trace_length(task_id: str, graph_path: Path) -> int:
+    success_path = graph_path.with_name(f"{task_id}_success_paths.json")
+    if not success_path.is_file():
+        matches = sorted(graph_path.parent.glob(f"{task_id}*success_paths.json"))
+        success_path = matches[0] if matches else success_path
+    if not success_path.is_file():
+        return 0
+    try:
+        payload = _read_json(success_path)
+    except Exception:
+        return 0
+    paths = payload.get("success_paths", []) if isinstance(payload, dict) else []
+    lengths: list[int] = []
+    for path in paths:
+        if not isinstance(path, dict):
+            continue
+        steps = path.get("atomic_steps") or path.get("actions") or path.get("trace") or []
+        if isinstance(steps, list) and steps:
+            lengths.append(len(steps))
+    return min(lengths, default=0)
+
+
+def _max_steps_for_level(
+    *,
+    task_id: str,
+    level: str,
+    graph_path: Path,
+    l1_max_steps: int,
+    l2_max_steps: int,
+    l3_max_steps: int,
+    l4_max_steps: int,
+    l5_max_steps: int,
+    l6_max_steps: int,
+    max_steps_factor: float,
+    l1_max_steps_factor: float = 0.0,
+    l2_max_steps_factor: float = 0.0,
+    l3_max_steps_factor: float = 0.0,
+    l4_max_steps_factor: float = 0.0,
+    l5_max_steps_factor: float = 0.0,
+    l6_max_steps_factor: float = 0.0,
+    max_steps_extra: int | None = None,
+    l1_max_steps_extra: int | None = None,
+    l2_max_steps_extra: int | None = None,
+    l3_max_steps_extra: int | None = None,
+    l4_max_steps_extra: int | None = None,
+    l5_max_steps_extra: int | None = None,
+    l6_max_steps_extra: int | None = None,
+) -> int:
+    extra = max_steps_extra
+    if level == "L1" and l1_max_steps_extra is not None:
+        extra = l1_max_steps_extra
+    elif level == "L2" and l2_max_steps_extra is not None:
+        extra = l2_max_steps_extra
+    elif level == "L3" and l3_max_steps_extra is not None:
+        extra = l3_max_steps_extra
+    elif level == "L4" and l4_max_steps_extra is not None:
+        extra = l4_max_steps_extra
+    elif level == "L5" and l5_max_steps_extra is not None:
+        extra = l5_max_steps_extra
+    elif level == "L6" and l6_max_steps_extra is not None:
+        extra = l6_max_steps_extra
+    if extra is not None and level in {"L1", "L2", "L3", "L4", "L5", "L6"}:
+        shortest = _shortest_success_trace_length(task_id, graph_path)
+        if shortest > 0:
+            return max(shortest, shortest + int(extra))
+
+    factor = float(max_steps_factor or 0)
+    if level == "L1":
+        factor = float(l1_max_steps_factor or factor)
+    elif level == "L2":
+        factor = float(l2_max_steps_factor or factor)
+    elif level == "L3":
+        factor = float(l3_max_steps_factor or factor)
+    elif level == "L4":
+        factor = float(l4_max_steps_factor or factor)
+    elif level == "L5":
+        factor = float(l5_max_steps_factor or factor)
+    elif level == "L6":
+        factor = float(l6_max_steps_factor or factor)
+    if factor > 0 and level in {"L1", "L2", "L3", "L4", "L5", "L6"}:
+        shortest = _shortest_success_trace_length(task_id, graph_path)
+        if shortest > 0:
+            return max(shortest, int(math.ceil(shortest * factor)))
+    if level == "L1":
+        return int(l1_max_steps)
+    if level == "L3":
+        return int(l3_max_steps)
+    if level == "L4":
+        return int(l4_max_steps)
+    if level == "L5":
+        return int(l5_max_steps)
+    if level == "L6":
+        return int(l6_max_steps)
+    return int(l2_max_steps)
+
+
+def _build_dialogue_steps(
+    *,
+    item: dict[str, Any],
+    results_root: Path,
+    run_dir: Path,
+    l1_max_steps: int,
+    l2_max_steps: int,
+    l3_max_steps: int,
+    l4_max_steps: int,
+    l5_max_steps: int,
+    l6_max_steps: int,
+    max_steps_factor: float,
+    l1_max_steps_factor: float = 0.0,
+    l2_max_steps_factor: float = 0.0,
+    l3_max_steps_factor: float = 0.0,
+    l4_max_steps_factor: float = 0.0,
+    l5_max_steps_factor: float = 0.0,
+    l6_max_steps_factor: float = 0.0,
+    max_steps_extra: int | None = None,
+    l1_max_steps_extra: int | None = None,
+    l2_max_steps_extra: int | None = None,
+    l3_max_steps_extra: int | None = None,
+    l4_max_steps_extra: int | None = None,
+    l5_max_steps_extra: int | None = None,
+    l6_max_steps_extra: int | None = None,
+    hide_decomposition: bool = False,
+) -> list[DialogueStep]:
+    composite_task_id = str(item.get("task_id") or "").strip()
+    if not composite_task_id:
+        raise ValueError("Ready item is missing task_id")
+    component_ids = _component_l1_ids(item)
+    if not component_ids:
+        raise ValueError(f"{composite_task_id} has no component_sources.mapped_source_l1_task_ids")
+    return _build_dialogue_steps_for_task_ids(
+        item=item,
+        results_root=results_root,
+        run_dir=run_dir,
+        task_ids=[*component_ids, composite_task_id],
+        l1_max_steps=l1_max_steps,
+        l2_max_steps=l2_max_steps,
+        l3_max_steps=l3_max_steps,
+        l4_max_steps=l4_max_steps,
+        l5_max_steps=l5_max_steps,
+        l6_max_steps=l6_max_steps,
+        max_steps_factor=max_steps_factor,
+        l1_max_steps_factor=l1_max_steps_factor,
+        l2_max_steps_factor=l2_max_steps_factor,
+        l3_max_steps_factor=l3_max_steps_factor,
+        l4_max_steps_factor=l4_max_steps_factor,
+        l5_max_steps_factor=l5_max_steps_factor,
+        l6_max_steps_factor=l6_max_steps_factor,
+        max_steps_extra=max_steps_extra,
+        l1_max_steps_extra=l1_max_steps_extra,
+        l2_max_steps_extra=l2_max_steps_extra,
+        l3_max_steps_extra=l3_max_steps_extra,
+        l4_max_steps_extra=l4_max_steps_extra,
+        l5_max_steps_extra=l5_max_steps_extra,
+        l6_max_steps_extra=l6_max_steps_extra,
+        hide_decomposition=hide_decomposition,
+    )
+
+
+def _build_dialogue_steps_for_task_ids(
+    *,
+    item: dict[str, Any],
+    results_root: Path,
+    run_dir: Path,
+    task_ids: list[str],
+    l1_max_steps: int,
+    l2_max_steps: int,
+    l3_max_steps: int,
+    l4_max_steps: int,
+    l5_max_steps: int,
+    l6_max_steps: int,
+    max_steps_factor: float,
+    l1_max_steps_factor: float = 0.0,
+    l2_max_steps_factor: float = 0.0,
+    l3_max_steps_factor: float = 0.0,
+    l4_max_steps_factor: float = 0.0,
+    l5_max_steps_factor: float = 0.0,
+    l6_max_steps_factor: float = 0.0,
+    max_steps_extra: int | None = None,
+    l1_max_steps_extra: int | None = None,
+    l2_max_steps_extra: int | None = None,
+    l3_max_steps_extra: int | None = None,
+    l4_max_steps_extra: int | None = None,
+    l5_max_steps_extra: int | None = None,
+    l6_max_steps_extra: int | None = None,
+    hide_decomposition: bool = False,
+) -> list[DialogueStep]:
+    sequence_task_ids = [str(task_id).strip() for task_id in task_ids if str(task_id).strip()]
+    if not sequence_task_ids:
+        raise ValueError("No dialogue task ids were provided.")
+
+    image_stage_root = run_dir / "prepared_unique_state_images"
+    task_runs_root = run_dir / "task_runs"
+
+    steps: list[DialogueStep] = []
+    for index, task_id in enumerate(sequence_task_ids, start=1):
+        level = _task_level(task_id, str(item.get("difficulty_level") or ""))
+        graph_path = _graph_path_for_task(results_root, task_id).resolve()
+        if not graph_path.exists():
+            raise FileNotFoundError(f"Missing graph file for {task_id}: {graph_path}")
+
+        stage_dir = image_stage_root / f"{index:02d}_{_safe_slug(task_id)}"
+        unique_state_image_dir = _prepare_direct_task_image_manifest(
+            results_root=results_root,
+            task_id=task_id,
+            stage_dir=stage_dir,
+        )
+        max_steps = _max_steps_for_level(
+            task_id=task_id,
+            level=level,
+            graph_path=graph_path,
+            l1_max_steps=int(l1_max_steps),
+            l2_max_steps=int(l2_max_steps),
+            l3_max_steps=int(l3_max_steps),
+            l4_max_steps=int(l4_max_steps),
+            l5_max_steps=int(l5_max_steps),
+            l6_max_steps=int(l6_max_steps),
+            max_steps_factor=float(max_steps_factor or 0),
+            l1_max_steps_factor=float(l1_max_steps_factor or 0),
+            l2_max_steps_factor=float(l2_max_steps_factor or 0),
+            l3_max_steps_factor=float(l3_max_steps_factor or 0),
+            l4_max_steps_factor=float(l4_max_steps_factor or 0),
+            l5_max_steps_factor=float(l5_max_steps_factor or 0),
+            l6_max_steps_factor=float(l6_max_steps_factor or 0),
+            max_steps_extra=max_steps_extra,
+            l1_max_steps_extra=l1_max_steps_extra,
+            l2_max_steps_extra=l2_max_steps_extra,
+            l3_max_steps_extra=l3_max_steps_extra,
+            l4_max_steps_extra=l4_max_steps_extra,
+            l5_max_steps_extra=l5_max_steps_extra,
+            l6_max_steps_extra=l6_max_steps_extra,
+        )
+
+        server_name = (
+            f"session_{index:02d}"
+            if hide_decomposition
+            else f"step_{index:02d}_{_safe_slug(task_id).lower()}"
+        )
+        steps.append(
+            DialogueStep(
+                index=index,
+                task_id=task_id,
+                level=level,
+                graph_path=graph_path,
+                unique_state_image_dir=unique_state_image_dir,
+                max_steps=max_steps,
+                server_name=server_name,
+                workspace_name=f"{index:02d}_{_safe_slug(task_id)}",
+                output_dir=task_runs_root / f"{index:02d}_{task_id}",
+            )
+        )
+    return steps

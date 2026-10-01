@@ -1,0 +1,1330 @@
+            models_config=models_config,
+            runtime_options=runtime_options,
+            post_task_prompt=post_task_prompt,
+            resume_checkpoint=resume_checkpoint,
+            resume_without_prompt=bool(resume_without_prompt),
+            tools_enabled=bool(tools_enabled),
+        )
+        execution = backend.run_task(spec)
+        result_error = execution.error
+        if export_checkpoint_dir is not None:
+            if result_error:
+                raise RuntimeError(
+                    f"Cannot export a failed learning run as a checkpoint: {result_error}"
+                )
+            exported_checkpoint = backend.export_checkpoint(
+                task_container_id,
+                export_checkpoint_dir,
+                metadata=checkpoint_metadata,
+            )
+        if execution.post_task_result is not None:
+            _write_json(run_dir / "post_task_result.json", execution.post_task_result.as_dict())
+        try:
+            backend.prepare_grading_transcript(task_container_id)
+        except Exception:
+            pass
+        usage = backend.collect_usage(task_container_id, run_dir, execution.elapsed_time)
+        if hasattr(backend, "_resolve_runtime_provider"):
+            diagnostics_api_key, diagnostics_base_url = backend._resolve_runtime_provider(args.model, models_config)
+    finally:
+        for step in steps:
+            if step.session is None:
+                continue
+            try:
+                runtime.finish(step.session.session_id)
+            except Exception:
+                pass
+        _stop_bridges(bridge_processes, steps)
+        if execution is not None:
+            for proc in (execution.gateway_proc, execution.agent_proc):
+                if proc is not None:
+                    try:
+                        if close_proc_log_fn is not None:
+                            close_proc_log_fn(proc)
+                    except Exception:
+                        pass
+        if remove_container_fn is not None:
+            remove_container_fn(task_container_id)
+
+    per_step = _export_step_outputs(runtime, steps)
+    diagnostics_results: list[dict[str, Any]] = []
+    if args.decision_diagnostics:
+        try:
+            from tongbench_eval.graph_env.framework_diagnostics import write_sidecar_decision_diagnostics
+        except Exception as exc:
+            diagnostics_results.append({"error": f"{type(exc).__name__}: {exc}"})
+        else:
+            for step in steps:
+                if step.session is None:
+                    continue
+                diagnostic_result: dict[str, Any] = {
+                    "index": step.index,
+                    "task_id": step.task_id,
+                    "output_dir": str(step.output_dir.resolve()),
+                }
+                try:
+                    diagnostics_path = write_sidecar_decision_diagnostics(
+                        output_dir=step.output_dir,
+                        api_key=diagnostics_api_key,
+                        base_url=diagnostics_base_url,
+                        model=args.model,
+                    )
+                    diagnostic_result["sidecar_decision_diagnostics_path"] = str(diagnostics_path.resolve())
+                    for exported_step in per_step:
+                        if exported_step.get("index") == step.index:
+                            exported_step["sidecar_decision_diagnostics_path"] = str(diagnostics_path.resolve())
+                            break
+                except Exception as exc:
+                    diagnostic_result["sidecar_decision_diagnostics_error"] = f"{type(exc).__name__}: {exc}"
+                    for exported_step in per_step:
+                        if exported_step.get("index") == step.index:
+                            exported_step["sidecar_decision_diagnostics_error"] = diagnostic_result["sidecar_decision_diagnostics_error"]
+                            break
+                diagnostics_results.append(diagnostic_result)
+    if usage is None:
+        usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "request_count": 0,
+            "elapsed_time": float(args.timeout_sec),
+        }
+    usage["framework_backend"] = args.backend
+    usage["conversation_task_id"] = task_container_id
+    if diagnostics_results:
+        usage["sidecar_decision_diagnostics"] = diagnostics_results
+    if result_error:
+        usage["error"] = result_error
+    _write_json(run_dir / "usage.json", usage)
+
+    summary = {
+        "task_id": composite_task_id,
+        "phase": phase,
+        "run_dir": str(run_dir.resolve()),
+        "conversation_task_id": task_container_id,
+        "error": result_error,
+        "usage": usage,
+        "sidecar_decision_diagnostics": diagnostics_results,
+        "final_response": execution.final_response if execution is not None else "",
+        "resume_checkpoint": resume_checkpoint.as_dict() if resume_checkpoint else None,
+        "exported_checkpoint": exported_checkpoint.as_dict() if exported_checkpoint else None,
+        "steps": per_step,
+    }
+    _write_json(run_dir / "sequence_summary.json", summary)
+    return summary
+
+
+def _learning_reuse_entry(args: argparse.Namespace, target_task_id: str) -> dict[str, Any] | None:
+    """Resolve an existing learning checkpoint without rebuilding its source steps."""
+    manifest_arg = str(getattr(args, "reuse_learning_manifest", "") or "").strip()
+    if not manifest_arg:
+        return None
+    manifest_path = Path(manifest_arg).expanduser().resolve()
+    payload = _read_json(manifest_path)
+    entries = payload.get("entries", []) if isinstance(payload, dict) else []
+    if isinstance(entries, dict):
+        entry = entries.get(target_task_id)
+    else:
+        entry = next(
+            (row for row in entries if isinstance(row, dict) and str(row.get("target_task_id") or "") == target_task_id),
+            None,
+        )
+    if not isinstance(entry, dict):
+        missing = payload.get("missing_entries", []) if isinstance(payload, dict) else []
+        raise KeyError(
+            f"Learning reuse manifest has no entry for {target_task_id}; "
+            f"missing_entries={len(missing) if isinstance(missing, list) else 0}: {manifest_path}"
+        )
+    return {**entry, "manifest_path": str(manifest_path)}
+
+
+def _shared_learning_context(
+    *,
+    item: dict[str, Any],
+    results_root: Path,
+    output_root: Path,
+    args: argparse.Namespace,
+    models_config: dict[str, Any] | None,
+    learning_task_ids: list[str],
+    create_if_missing: bool,
+) -> tuple[AgentCheckpoint | None, dict[str, Any], dict[str, Any]]:
+    target_task_id = str(item.get("task_id") or "").strip()
+    reuse_entry = _learning_reuse_entry(args, target_task_id)
+    if reuse_entry is not None:
+        source_checkpoint_dir = Path(str(reuse_entry.get("source_checkpoint_dir") or "")).expanduser().resolve()
+        checkpoint_load_dir = source_checkpoint_dir
+        if not (checkpoint_load_dir / "agent_checkpoint.json").is_file():
+            checkpoint_load_dir = source_checkpoint_dir / "checkpoint"
+        source_summary_path = Path(str(reuse_entry.get("source_learning_summary_path") or "")).expanduser().resolve()
+        if not (checkpoint_load_dir / "agent_checkpoint.json").is_file():
+            raise FileNotFoundError(f"Reused learning checkpoint is missing: {source_checkpoint_dir}")
+        if not source_summary_path.is_file():
+            raise FileNotFoundError(f"Reused learning summary is missing: {source_summary_path}")
+        checkpoint = AgentCheckpoint.load(checkpoint_load_dir, expected_backend=args.backend)
+        learning_summary = _read_json(source_summary_path)
+        metadata = dict(checkpoint.metadata or {})
+        reuse_meta = {
+            "mode": "reused_existing_learning_checkpoint",
+            "manifest_path": reuse_entry["manifest_path"],
+            "source_parent_task_id": str(reuse_entry.get("source_parent_task_id") or ""),
+            "source_checkpoint_dir": str(source_checkpoint_dir),
+            "source_learning_summary_path": str(source_summary_path),
+            "target_task_id": target_task_id,
+            "learning_task_ids": list(reuse_entry.get("learning_task_ids") or learning_task_ids),
+        }
+        metadata["learning_reuse"] = reuse_meta
+        learning_summary = {
+            **learning_summary,
+            "learning_reuse": reuse_meta,
+            "reused_for_target_task_id": target_task_id,
+        }
+        return checkpoint, learning_summary, metadata
+
+    bundle_dir = _learning_checkpoint_bundle_dir(
+        args=args,
+        output_root=output_root,
+        target_task_id=target_task_id,
+    )
+    checkpoint_dir = bundle_dir / "checkpoint"
+    manifest_path = bundle_dir / "learning_prefix_manifest.json"
+    learning_run_dir = bundle_dir / "learning_run"
+
+    if not checkpoint_dir.exists() and bundle_dir.exists() and create_if_missing and not args.dry_run:
+        shutil.rmtree(bundle_dir)
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    learning_steps = _build_dialogue_steps_for_task_ids(
+        item=item,
+        results_root=results_root,
+        run_dir=learning_run_dir,
+        task_ids=learning_task_ids,
+        l1_max_steps=int(args.l1_max_steps),
+        l2_max_steps=int(args.l2_max_steps),
+        l3_max_steps=int(args.l3_max_steps),
+        l4_max_steps=int(args.l4_max_steps),
+        l5_max_steps=int(args.l5_max_steps),
+        l6_max_steps=int(args.l6_max_steps),
+        max_steps_factor=float(args.max_steps_factor or 0),
+        l1_max_steps_factor=float(args.l1_max_steps_factor or 0),
+        l2_max_steps_factor=float(args.l2_max_steps_factor or 0),
+        l3_max_steps_factor=float(args.l3_max_steps_factor or 0),
+        l4_max_steps_factor=float(args.l4_max_steps_factor or 0),
+        l5_max_steps_factor=float(args.l5_max_steps_factor or 0),
+        l6_max_steps_factor=float(args.l6_max_steps_factor or 0),
+        max_steps_extra=args.max_steps_extra,
+        l1_max_steps_extra=args.l1_max_steps_extra,
+        l2_max_steps_extra=args.l2_max_steps_extra,
+        l3_max_steps_extra=args.l3_max_steps_extra,
+        l4_max_steps_extra=args.l4_max_steps_extra,
+        l5_max_steps_extra=args.l5_max_steps_extra,
+        l6_max_steps_extra=args.l6_max_steps_extra,
+        hide_decomposition=bool(args.hide_decomposition),
+    )
+    learning_prompt = _safe_choice_skill_learning_prompt(learning_steps, args=args)
+    metadata = _learning_checkpoint_metadata(
+        target_task_id=target_task_id,
+        learning_steps=learning_steps,
+        prompt=learning_prompt,
+        args=args,
+    )
+
+    if checkpoint_dir.exists():
+        checkpoint = AgentCheckpoint.load(checkpoint_dir, expected_backend=args.backend)
+        actual_fingerprint = str(checkpoint.metadata.get("fingerprint_sha256") or "")
+        expected_fingerprint = str(metadata["fingerprint_sha256"])
+        if actual_fingerprint != expected_fingerprint:
+            raise ValueError(
+                "Shared learning checkpoint fingerprint mismatch: "
+                f"expected {expected_fingerprint}, got {actual_fingerprint or '(missing)'}."
+            )
+        summary_path = learning_run_dir / "sequence_summary.json"
+        if not summary_path.exists():
+            raise FileNotFoundError(
+                f"Shared learning checkpoint has no learning summary: {summary_path}"
+            )
+        return checkpoint, _read_json(summary_path), metadata
+
+    if not create_if_missing:
+        raise FileNotFoundError(
+            "Skill requires the shared ICL learning checkpoint, but it does not exist: "
+            f"{checkpoint_dir}. Run the matching in_context mode first."
+        )
+
+    if args.dry_run:
+        dry_summary = _run_one_dialogue_attempt(
+            item=item,
+            results_root=results_root,
+            run_dir=learning_run_dir,
+            args=args,
+            models_config=models_config,
+            steps=learning_steps,
+            prompt=learning_prompt,
+            phase="shared_learning",
+            learning_task_ids=learning_task_ids,
+        )
+        _write_json(manifest_path, metadata)
+        return None, dry_summary, metadata
+
+    learning_summary = _run_one_dialogue_attempt(
+        item=item,
+        results_root=results_root,
+        run_dir=learning_run_dir,
+        args=args,
+        models_config=models_config,
+        steps=learning_steps,
+        prompt=learning_prompt,
+        phase="shared_learning",
+        learning_task_ids=learning_task_ids,
+        export_checkpoint_dir=checkpoint_dir,
+        checkpoint_metadata=metadata,
+    )
+    checkpoint = AgentCheckpoint.load(checkpoint_dir, expected_backend=args.backend)
+    _write_json(
+        manifest_path,
+        {
+            **metadata,
+            "checkpoint": checkpoint.as_dict(),
+            "learning_summary_path": str((learning_run_dir / "sequence_summary.json").resolve()),
+        },
+    )
+    return checkpoint, learning_summary, metadata
+
+
+def _record_checkpoint_branch_validation(
+    *,
+    checkpoint: AgentCheckpoint,
+    branch_output_dir: Path,
+    branch_prompt: str | None,
+    tools_enabled: bool = True,
+) -> dict[str, Any]:
+    from tongbench_eval.agents.checkpoint_validation import validate_checkpoint_branch
+
+    report = validate_checkpoint_branch(
+        checkpoint=checkpoint,
+        branch_output_dir=branch_output_dir,
+        branch_prompt=branch_prompt,
+        tools_enabled=tools_enabled,
+    )
+    if report.get("equivalent") is False:
+        report["warning"] = (
+            "Restored branch prefix differs from the saved checkpoint. This is recorded but not "
+            "fatal because a harness may apply its own context/session management, such as "
+            "compression, after checkpoint restore."
+        )
+    _write_json(branch_output_dir / "checkpoint_branch_validation.json", report)
+    return report
+
+
+def _audit_skill_summary_context(
+    *,
+    learning_dir: Path,
+    checkpoint: AgentCheckpoint,
+    summary_call: dict[str, Any],
+    learning_task_ids: list[str],
+) -> dict[str, Any]:
+    """Verify that the Skill summary saw the saved learning history intact.
+
+    The application dialogue may use the compact context projection.  The
+    summary dialogue is different: it must read the complete L2 checkpoint.
+    Keep this check local to the summary branch so a compact application run
+    cannot silently produce a Skill from a compaction placeholder.
+    """
+    plan_path = learning_dir / "dialogue_plan.json"
+    plan = _read_json(plan_path) if plan_path.is_file() else {}
+    expected_task_ids = [str(task_id) for task_id in learning_task_ids]
+    checkpoint_task_ids = [
+        str(task_id)
+        for task_id in (checkpoint.metadata.get("learning_task_ids") or [])
+    ]
+    failures: list[str] = []
+    if summary_call.get("error"):
+        failures.append(f"summary dialogue failed: {summary_call.get('error')}")
+    if plan.get("context_mode") != "full":
+        failures.append(
+            f"summary dialogue context_mode must be full, got {plan.get('context_mode')!r}"
+        )
+    if checkpoint_task_ids and checkpoint_task_ids != expected_task_ids:
+        failures.append(
+            "summary checkpoint learning_task_ids differ from the requested L2 tasks: "
+            f"expected={expected_task_ids!r}, got={checkpoint_task_ids!r}"
+        )
+    if not checkpoint_task_ids:
+        failures.append("summary checkpoint has no learning_task_ids metadata")
+
+    compaction_markers = (
+        "CONTEXT COMPACTION — REFERENCE ONLY",
+        "CONTEXT COMPACTION - REFERENCE ONLY",
+        "Summary generation was unavailable.",
+    )
+    marker_files: list[str] = []
+    scanned_files: list[str] = []
+    for path in sorted(learning_dir.rglob("*")):
+        if not path.is_file() or path.name == "skill_summary_context_audit.json":
+            continue
+        scanned_files.append(str(path.relative_to(learning_dir)))
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        if any(marker in text for marker in compaction_markers):
+            marker_files.append(str(path.relative_to(learning_dir)))
+    if marker_files:
+        failures.append(
+            "summary output contains a context-compaction placeholder in "
+            + ", ".join(marker_files)
+        )
+
+    audit = {
+        "schema_version": "tongbench_skill_summary_context_audit_v1",
+        "context_mode": plan.get("context_mode"),
+        "context_mode_override": plan.get("context_mode_override"),
+        "summary_phase": plan.get("phase"),
+        "learning_task_ids": expected_task_ids,
+        "checkpoint_learning_task_ids": checkpoint_task_ids,
+        "checkpoint_payload_sha256": checkpoint.payload_sha256,
+        "checkpoint_path": str(checkpoint.path),
+        "summary_call_error": summary_call.get("error"),
+        "compaction_marker_files": marker_files,
+        "scanned_files": scanned_files,
+        "passed": not failures,
+        "failures": failures,
+    }
+    _write_json(learning_dir / "skill_summary_context_audit.json", audit)
+    if failures:
+        raise RuntimeError("Skill summary context audit failed: " + " | ".join(failures))
+    return audit
+
+
+def _run_one_skill_dialogue(
+    *,
+    item: dict[str, Any],
+    results_root: Path,
+    output_root: Path,
+    args: argparse.Namespace,
+    models_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if args.protocol_surface != "safe_choice":
+        raise ValueError("--self-evolution-mode skill requires --protocol-surface safe_choice.")
+
+    composite_task_id = str(item.get("task_id") or "").strip()
+    if not composite_task_id:
+        raise ValueError("Ready item is missing task_id")
+
+    run_dir = output_root / composite_task_id
+    if args.skip_existing and not args.force and not args.dry_run:
+        existing_summary = _load_existing_skill_summary(output_root, composite_task_id)
+        uses_external_skill = bool(str(getattr(args, "skill_file", "") or "").strip())
+        if existing_summary is not None and (
+            uses_external_skill
+            or _existing_summary_has_valid_learning_checkpoint(
+                existing_summary,
+                backend=args.backend,
+            )
+        ):
+            return existing_summary
+    if not args.dry_run:
+        _clear_existing_run_dir(run_dir, output_root)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    skill_file_arg = str(getattr(args, "skill_file", "") or "").strip()
+    skill_learning_only = bool(getattr(args, "skill_learning_only", False))
+    learning_task_ids = _learning_task_ids(args, composite_task_id)
+    component_ids = learning_task_ids or _component_l1_ids(item)
+    if skill_file_arg:
+        component_ids = learning_task_ids
+    elif not component_ids:
+        raise ValueError(f"{composite_task_id} has no learning tasks and no component_sources.mapped_source_l1_task_ids")
+
+    learning_dir = run_dir / "skill_learning"
+    skill_record: dict[str, Any]
+    learning_checkpoint: AgentCheckpoint | None = None
+    skill_summary_call: dict[str, Any] | None = None
+    if skill_file_arg:
+        source_skill_path = Path(skill_file_arg).expanduser().resolve()
+        if not source_skill_path.exists():
+            raise FileNotFoundError(f"Missing --skill-file: {source_skill_path}")
+        skill_text = _extract_skill_text_for_backend(
+            args.backend,
+            source_skill_path.read_text(encoding="utf-8"),
+        )
+        if not skill_text:
+            raise ValueError(f"--skill-file is empty: {source_skill_path}")
+        learning_dir.mkdir(parents=True, exist_ok=True)
+        skill_path = learning_dir / "generated_skill.md"
+        if not args.dry_run:
+            skill_path.write_text(skill_text + "\n", encoding="utf-8")
+        learning_summary = {
+            "task_id": composite_task_id,
+            "phase": "skill_learning",
+            "run_dir": str(learning_dir.resolve()),
+            "skipped": True,
+            "reason": "--skill-file provided; using an existing category skill.",
+            "source_skill_file": str(source_skill_path),
+            "steps": [],
+        }
+        _write_json(learning_dir / "sequence_summary.json", learning_summary)
+        skill_record = {
+            "skill_path": str(skill_path.resolve()),
+            "source_skill_file": str(source_skill_path),
+            "word_count": _skill_word_count(skill_text),
+            "extracted": True,
+            "external_skill_file": True,
+            "backend": args.backend,
+            "skill_chars": len(skill_text),
+            "skill_sha256": _sha256_text(skill_text),
+            "skill_text": skill_text,
+        }
+    else:
+        skill_summary_prompt = _safe_choice_skill_summary_prompt()
+        learning_checkpoint, learning_summary, _ = _shared_learning_context(
+            item=item,
+            results_root=results_root,
+            output_root=output_root,
+            args=args,
+            models_config=models_config,
+            learning_task_ids=component_ids,
+            create_if_missing=bool(args.dry_run),
+        )
+
+        if args.dry_run:
+            skill_text = "# Dry Run Skill\n\nThis placeholder is used only for dry-run planning."
+            skill_path = learning_dir / "generated_skill.md"
+            skill_record = {
+                "skill_path": str(skill_path.resolve()),
+                "word_count": _skill_word_count(skill_text),
+                "extracted": False,
+                "dry_run": True,
+                "skill_text": skill_text,
+            }
+        else:
+            if learning_checkpoint is None:
+                raise RuntimeError("Shared learning checkpoint was not resolved for skill mode.")
+            skill_summary_call = _run_one_dialogue_attempt(
+                item=item,
+                results_root=results_root,
+                run_dir=learning_dir,
+                args=args,
+                models_config=models_config,
+                steps=[],
+                prompt=skill_summary_prompt,
+                phase="skill_summary",
+                learning_task_ids=component_ids,
+                resume_checkpoint=learning_checkpoint,
+                tools_enabled=False,
+                context_mode_override="full",
+                disable_context_compression=True,
+            )
+            summary_context_audit = _audit_skill_summary_context(
+                learning_dir=learning_dir,
+                checkpoint=learning_checkpoint,
+                summary_call=skill_summary_call,
+                learning_task_ids=component_ids,
+            )
+            skill_summary_call["skill_summary_context_audit"] = summary_context_audit
+            if not skill_summary_call.get("error"):
+                branch_validation = _record_checkpoint_branch_validation(
+                    checkpoint=learning_checkpoint,
+                    branch_output_dir=learning_dir,
+                    branch_prompt=skill_summary_prompt,
+                    tools_enabled=False,
+                )
+                skill_summary_call["checkpoint_branch_validation"] = branch_validation
+            _write_json(
+                learning_dir / "post_task_result.json",
+                {
+                    "prompt": skill_summary_prompt,
+                    "final_response": str(skill_summary_call.get("final_response") or ""),
+                    "completed": not bool(skill_summary_call.get("error")),
+                    "api_calls": int(
+                        (skill_summary_call.get("usage") or {}).get("request_count") or 0
+                    ),
+                    "error": skill_summary_call.get("error"),
+                    "source_checkpoint_payload_sha256": learning_checkpoint.payload_sha256,
+                },
+            )
+            skill_record = _write_generated_skill(learning_dir, backend=args.backend)
+            skill_text = str(skill_record.get("skill_text") or "").strip()
+            if not skill_text:
+                summary = {
+                    "task_id": composite_task_id,
+                    "self_evolution_mode": "skill",
+                    "run_dir": str(run_dir.resolve()),
+                    "error": str(skill_record.get("error") or "Skill extraction failed."),
+                    "learning_task_ids": component_ids,
+                    "component_l1_task_ids": _component_l1_ids(item),
+                    "skill_learning_only": skill_learning_only,
+                    "skill_file": "",
+                    "skill": {key: value for key, value in skill_record.items() if key != "skill_text"},
+                    "learning": learning_summary,
+                    "learning_checkpoint": learning_checkpoint.as_dict() if learning_checkpoint else None,
+                    "skill_summary_call": skill_summary_call,
+                    "application": None,
+                }
+                _write_json(run_dir / "skill_mode_summary.json", summary)
+                return summary
+
+    if skill_learning_only:
+        skill_summary = {key: value for key, value in skill_record.items() if key != "skill_text"}
+        warnings = []
+        summary = {
+            "task_id": composite_task_id,
+            "self_evolution_mode": "skill",
+            "run_dir": str(run_dir.resolve()),
+            "error": learning_summary.get("error"),
+            "warnings": warnings,
+            "learning_task_ids": component_ids,
+            "component_l1_task_ids": _component_l1_ids(item),
+            "skill_learning_only": True,
+            "skill_file": skill_file_arg,
+            "skill": skill_summary,
+            "learning": learning_summary,
+            "learning_checkpoint": learning_checkpoint.as_dict() if learning_checkpoint else None,
+            "skill_summary_call": skill_summary_call,
+            "application": None,
+        }
+        _write_json(run_dir / "skill_mode_summary.json", summary)
+        return summary
+
+    application_dir = run_dir / "skill_application"
+    application_steps = _build_dialogue_steps_for_task_ids(
+        item=item,
+        results_root=results_root,
+        run_dir=application_dir,
+        task_ids=[composite_task_id],
+        l1_max_steps=int(args.l1_max_steps),
+        l2_max_steps=int(args.l2_max_steps),
+        l3_max_steps=int(args.l3_max_steps),
+        l4_max_steps=int(args.l4_max_steps),
+        l5_max_steps=int(args.l5_max_steps),
+        l6_max_steps=int(args.l6_max_steps),
+        max_steps_factor=float(args.max_steps_factor or 0),
+        l1_max_steps_factor=float(args.l1_max_steps_factor or 0),
+        l2_max_steps_factor=float(args.l2_max_steps_factor or 0),
+        l3_max_steps_factor=float(args.l3_max_steps_factor or 0),
+        l4_max_steps_factor=float(args.l4_max_steps_factor or 0),
+        l5_max_steps_factor=float(args.l5_max_steps_factor or 0),
+        l6_max_steps_factor=float(args.l6_max_steps_factor or 0),
+        max_steps_extra=args.max_steps_extra,
+        l1_max_steps_extra=args.l1_max_steps_extra,
+        l2_max_steps_extra=args.l2_max_steps_extra,
+        l3_max_steps_extra=args.l3_max_steps_extra,
+        l4_max_steps_extra=args.l4_max_steps_extra,
+        l5_max_steps_extra=args.l5_max_steps_extra,
+        l6_max_steps_extra=args.l6_max_steps_extra,
+        hide_decomposition=bool(args.hide_decomposition),
+    )
+    application_prompt = _safe_choice_skill_application_prompt(
+        application_steps,
+        args=args,
+        skill_text=skill_text,
+    )
+    expected_skill_block = f"<skill>\n{skill_text}\n</skill>"
+    if expected_skill_block not in application_prompt:
+        raise RuntimeError(
+            f"Skill text was not embedded in the {args.backend} application prompt."
+        )
+    _write_json(
+        application_dir / "skill_injection.json",
+        {
+            "backend": args.backend,
+            "source_skill_path": str(skill_record.get("skill_path") or ""),
+            "source_skill_sha256": _sha256_text(skill_text),
+            "embedded_skill_sha256": _sha256_text(skill_text),
+            "skill_chars": len(skill_text),
+            "embedded": True,
+        },
+    )
+    (application_dir / "application_prompt.txt").write_text(
+        application_prompt,
+        encoding="utf-8",
+    )
+    application_summary = _run_one_dialogue_attempt(
+        item=item,
+        results_root=results_root,
+        run_dir=application_dir,
+        args=args,
+        models_config=models_config,
+        steps=application_steps,
+        prompt=application_prompt,
+        phase="skill_application",
+    )
+
+    skill_summary = {key: value for key, value in skill_record.items() if key != "skill_text"}
+    error = learning_summary.get("error") or application_summary.get("error")
+    warnings = []
+    summary = {
+        "task_id": composite_task_id,
+        "self_evolution_mode": "skill",
+        "run_dir": str(run_dir.resolve()),
+        "error": error,
+        "warnings": warnings,
+        "learning_task_ids": component_ids,
+        "component_l1_task_ids": _component_l1_ids(item),
+        "skill_learning_only": skill_learning_only,
+        "skill_file": skill_file_arg,
+        "skill": skill_summary,
+        "learning": learning_summary,
+        "learning_checkpoint": learning_checkpoint.as_dict() if learning_checkpoint else None,
+        "skill_summary_call": skill_summary_call,
+        "application": application_summary,
+    }
+    _write_json(run_dir / "skill_mode_summary.json", summary)
+    return summary
+
+
+def _run_one_dialogue(
+    *,
+    item: dict[str, Any],
+    results_root: Path,
+    output_root: Path,
+    args: argparse.Namespace,
+    models_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if getattr(args, "self_evolution_mode", "in_context") == "skill":
+        return _run_one_skill_dialogue(
+            item=item,
+            results_root=results_root,
+            output_root=output_root,
+            args=args,
+            models_config=models_config,
+        )
+
+    composite_task_id = str(item.get("task_id") or "").strip()
+    run_dir = output_root / composite_task_id
+    if args.skip_existing and not args.force and not args.dry_run:
+        existing_summary = _load_existing_dialogue_summary(output_root, composite_task_id)
+        requires_learning_checkpoint = bool(
+            str(getattr(args, "learning_plan_json", "") or "").strip()
+            or str(getattr(args, "related_learning_ready_json", "") or "").strip()
+            or (
+                isinstance(existing_summary, dict)
+                and existing_summary.get("learning_task_ids")
+            )
+        )
+        if existing_summary is not None and (
+            not requires_learning_checkpoint
+            or _existing_summary_has_valid_learning_checkpoint(
+                existing_summary,
+                backend=args.backend,
+            )
+        ):
+            return existing_summary
+    if not args.dry_run:
+        _clear_existing_run_dir(run_dir, output_root)
+    related_learning_selection = None
+    learning_task_ids = _learning_task_ids(args, composite_task_id)
+    if not learning_task_ids:
+        related_learning_selection = _related_l3_selection_for_l6(
+            item,
+            ready_json=getattr(args, "related_learning_ready_json", None),
+            max_count=int(getattr(args, "related_learning_max_count", 0) or 0),
+        )
+        learning_task_ids = [str(task_id) for task_id in related_learning_selection.get("selected_task_ids", [])]
+    if learning_task_ids:
+        learning_checkpoint, learning_summary, _ = _shared_learning_context(
+            item=item,
+            results_root=results_root,
+            output_root=output_root,
+            args=args,
+            models_config=models_config,
+            learning_task_ids=learning_task_ids,
+            create_if_missing=True,
+        )
+        application_checkpoint = learning_checkpoint
+        application_prompt = _safe_choice_checkpoint_application_prompt()
+        resume_without_prompt = False
+        if learning_checkpoint is not None and args.backend == "hermesagent":
+            from tongbench_eval.agents.checkpoint_validation import build_hermes_in_context_checkpoint
+
+            application_checkpoint = build_hermes_in_context_checkpoint(
+                source=learning_checkpoint,
+                destination=(
+                    output_root
+                    / "_reused_in_context_checkpoints"
+                    / _safe_slug(composite_task_id)
+                / "in_context_checkpoint"
+                ),
+            )
+        target_steps = _build_dialogue_steps_for_task_ids(
+            item=item,
+            results_root=results_root,
+            run_dir=run_dir,
+            task_ids=[composite_task_id],
+            l1_max_steps=int(args.l1_max_steps),
+            l2_max_steps=int(args.l2_max_steps),
+            l3_max_steps=int(args.l3_max_steps),
+        l4_max_steps=int(args.l4_max_steps),
+        l5_max_steps=int(args.l5_max_steps),
+        l6_max_steps=int(args.l6_max_steps),
+            max_steps_factor=float(args.max_steps_factor or 0),
+            l1_max_steps_factor=float(args.l1_max_steps_factor or 0),
+            l2_max_steps_factor=float(args.l2_max_steps_factor or 0),
+            l3_max_steps_factor=float(args.l3_max_steps_factor or 0),
+        l4_max_steps_factor=float(args.l4_max_steps_factor or 0),
+        l5_max_steps_factor=float(args.l5_max_steps_factor or 0),
+        l6_max_steps_factor=float(args.l6_max_steps_factor or 0),
+            max_steps_extra=args.max_steps_extra,
+            l1_max_steps_extra=args.l1_max_steps_extra,
+            l2_max_steps_extra=args.l2_max_steps_extra,
+            l3_max_steps_extra=args.l3_max_steps_extra,
+        l4_max_steps_extra=args.l4_max_steps_extra,
+        l5_max_steps_extra=args.l5_max_steps_extra,
+        l6_max_steps_extra=args.l6_max_steps_extra,
+            hide_decomposition=bool(args.hide_decomposition),
+        )
+        application_summary = _run_one_dialogue_attempt(
+            item=item,
+            results_root=results_root,
+            run_dir=run_dir,
+            args=args,
+            models_config=models_config,
+            steps=target_steps,
+            prompt=application_prompt,
+            phase="in_context_application",
+            learning_task_ids=learning_task_ids,
+            related_learning_selection=related_learning_selection,
+            resume_checkpoint=application_checkpoint,
+            resume_without_prompt=resume_without_prompt,
+        )
+        if application_checkpoint is not None and not application_summary.get("error"):
+            branch_validation = _record_checkpoint_branch_validation(
+                checkpoint=application_checkpoint,
+                branch_output_dir=run_dir,
+                branch_prompt=application_prompt,
+            )
+            application_summary["checkpoint_branch_validation"] = branch_validation
+        combined_steps = []
+        for index, step_summary in enumerate(
+            [*(learning_summary.get("steps") or []), *(application_summary.get("steps") or [])],
+            start=1,
+        ):
+            combined_steps.append({**step_summary, "index": index})
+        first_summary = {
+            **application_summary,
+            "self_evolution_mode": "in_context",
+            "error": learning_summary.get("error") or application_summary.get("error"),
+            "learning_task_ids": learning_task_ids,
+            "related_learning_selection": related_learning_selection,
+            "learning_checkpoint": learning_checkpoint.as_dict() if learning_checkpoint else None,
+            "in_context_checkpoint": application_checkpoint.as_dict() if application_checkpoint else None,
+            "learning": learning_summary,
+            "application": application_summary,
+            "steps": combined_steps,
+        }
+        _write_json(run_dir / "sequence_summary.json", first_summary)
+        return first_summary
+
+    steps = None
+    if learning_task_ids:
+        steps = _build_dialogue_steps_for_task_ids(
+            item=item,
+            results_root=results_root,
+            run_dir=run_dir,
+            task_ids=[*learning_task_ids, composite_task_id],
+            l1_max_steps=int(args.l1_max_steps),
+            l2_max_steps=int(args.l2_max_steps),
+            l3_max_steps=int(args.l3_max_steps),
+        l4_max_steps=int(args.l4_max_steps),
+        l5_max_steps=int(args.l5_max_steps),
+        l6_max_steps=int(args.l6_max_steps),
+            max_steps_factor=float(args.max_steps_factor or 0),
+            l1_max_steps_factor=float(args.l1_max_steps_factor or 0),
+            l2_max_steps_factor=float(args.l2_max_steps_factor or 0),
+            l3_max_steps_factor=float(args.l3_max_steps_factor or 0),
+        l4_max_steps_factor=float(args.l4_max_steps_factor or 0),
+        l5_max_steps_factor=float(args.l5_max_steps_factor or 0),
+        l6_max_steps_factor=float(args.l6_max_steps_factor or 0),
+            max_steps_extra=args.max_steps_extra,
+            l1_max_steps_extra=args.l1_max_steps_extra,
+            l2_max_steps_extra=args.l2_max_steps_extra,
+            l3_max_steps_extra=args.l3_max_steps_extra,
+        l4_max_steps_extra=args.l4_max_steps_extra,
+        l5_max_steps_extra=args.l5_max_steps_extra,
+        l6_max_steps_extra=args.l6_max_steps_extra,
+            hide_decomposition=bool(args.hide_decomposition),
+        )
+    first_summary = _run_one_dialogue_attempt(
+        item=item,
+        results_root=results_root,
+        run_dir=run_dir,
+        args=args,
+        models_config=models_config,
+        steps=steps,
+        learning_task_ids=learning_task_ids,
+        related_learning_selection=related_learning_selection,
+    )
+    retry_reason = _codex_outer_retry_reason(first_summary.get("error"))
+
+    if args.dry_run or args.backend != "codex" or retry_reason is None:
+        return first_summary
+
+    archived_attempt = _archive_retry_attempt(
+        run_dir=run_dir,
+        output_root=output_root,
+        composite_task_id=composite_task_id,
+        attempt_index=1,
+    )
+    retry_summary = _run_one_dialogue_attempt(
+        item=item,
+        results_root=results_root,
+        run_dir=run_dir,
+        args=args,
+        models_config=models_config,
+        steps=steps,
+    )
+    retry_history = [
+        {
+            "attempt": 1,
+            "error": first_summary.get("error"),
+            "archived_run_dir": str(archived_attempt.resolve()) if archived_attempt else None,
+            "retry_reason": retry_reason,
+        },
+        {
+            "attempt": 2,
+            "error": retry_summary.get("error"),
+            "run_dir": str(run_dir.resolve()),
+        },
+    ]
+    retry_summary["outer_retry"] = {
+        "attempts": 2,
+        "reason": retry_reason,
+        "first_attempt_archived_run_dir": str(archived_attempt.resolve()) if archived_attempt else None,
+    }
+    retry_summary["retry_history"] = retry_history
+    usage = retry_summary.get("usage")
+    if isinstance(usage, dict):
+        usage["outer_retry_count"] = 1
+        usage["outer_retry_reason"] = retry_reason
+        usage["first_attempt_archived_run_dir"] = (
+            str(archived_attempt.resolve()) if archived_attempt else None
+        )
+        _write_json(run_dir / "usage.json", usage)
+    _write_json(run_dir / "outer_retry_history.json", retry_history)
+    _write_json(run_dir / "sequence_summary.json", retry_summary)
+    return retry_summary
+
+
+def _load_existing_dialogue_summary(output_root: Path, composite_task_id: str) -> dict[str, Any] | None:
+    candidates = [output_root / composite_task_id / "sequence_summary.json"]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            payload = _read_json(path)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        return {
+            **payload,
+            "task_id": str(payload.get("task_id") or composite_task_id),
+            "status": "skipped_existing",
+            "skipped_existing": True,
+            "existing_result_path": str(path.resolve()),
+        }
+    return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run collected L2/L3 TongSIM image-reuse tasks as one dialogue per composite task: "
+            "component L1 tasks first, then the composite task."
+        )
+    )
+    parser.add_argument("--ready-json", required=True, help="Path to ready_l2_l3_tasks_with_images.json.")
+    parser.add_argument("--results-root", help="Root of the image-reuse result bundle. Defaults from the ready JSON location.")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--backend", choices=["hermesagent", "codex", "claudecode", "openclaw"], default="hermesagent")
+    parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--runtime",
+        choices=["docker", "native"],
+        default=None,
+        help="Execution runtime. docker uses the Docker daemon; native uses the bundled user-space runtime.",
+    )
+    parser.add_argument(
+        "--description-field",
+        default="description",
+        help="Task JSON description field exposed to the model. Defaults to the legacy description field.",
+    )
+    parser.add_argument(
+        "--hide-decomposition",
+        action="store_true",
+        help="Hide component task ids, component descriptions, and task-id-derived session names from model-facing dialogue context.",
+    )
+    parser.add_argument("--models-config")
+    parser.add_argument("--api-key", help="Override the selected model provider API key without using an environment variable.")
+    parser.add_argument("--base-url", help="Override the selected model provider OpenAI-compatible base URL.")
+    parser.add_argument("--framework-interaction-mode", choices=["semantic_tool"], default="semantic_tool")
+    parser.add_argument("--timeout-sec", type=int, default=1200, help="Timeout for one composite dialogue.")
+    parser.add_argument("--l1-max-steps", type=int, default=6, help="Max environment actions for each component L1 task.")
+    parser.add_argument("--l2-max-steps", type=int, default=12, help="Max environment actions for each L2 task.")
+    parser.add_argument("--l3-max-steps", type=int, default=18, help="Max environment actions for each L3 task if present.")
+    parser.add_argument("--l4-max-steps", type=int, default=24, help="Max environment actions for each L4 task if no shortest-path factor applies.")
+    parser.add_argument("--l5-max-steps", type=int, default=30, help="Max environment actions for each L5 task if no shortest-path factor applies.")
+    parser.add_argument("--l6-max-steps", type=int, default=36, help="Max environment actions for each L6 task if no shortest-path factor applies.")
+    parser.add_argument(
+        "--max-steps-extra",
+        type=int,
+        default=None,
+        help="When set, use shortest success trace length plus this many extra steps for all high-level levels.",
+    )
+    parser.add_argument("--l1-max-steps-extra", type=int, default=None, help="Override --max-steps-extra for L1 tasks.")
+    parser.add_argument("--l2-max-steps-extra", type=int, default=None, help="Override --max-steps-extra for L2 tasks.")
+    parser.add_argument("--l3-max-steps-extra", type=int, default=None, help="Override --max-steps-extra for L3 tasks.")
+    parser.add_argument("--l4-max-steps-extra", type=int, default=None, help="Override --max-steps-extra for L4 tasks.")
+    parser.add_argument("--l5-max-steps-extra", type=int, default=None, help="Override --max-steps-extra for L5 tasks.")
+    parser.add_argument("--l6-max-steps-extra", type=int, default=None, help="Override --max-steps-extra for L6 tasks.")
+    parser.add_argument(
+        "--max-steps-factor",
+        type=float,
+        default=0.0,
+        help="When >0, set high-level task max_steps to ceil(factor * shortest success trace length).",
+    )
+    parser.add_argument(
+        "--l1-max-steps-factor",
+        type=float,
+        default=0.0,
+        help="When >0, override --max-steps-factor for L1 tasks only.",
+    )
+    parser.add_argument(
+        "--l2-max-steps-factor",
+        type=float,
+        default=0.0,
+        help="When >0, override --max-steps-factor for L2 tasks only.",
+    )
+    parser.add_argument(
+        "--l3-max-steps-factor",
+        type=float,
+        default=0.0,
+        help="When >0, override --max-steps-factor for L3 tasks only.",
+    )
+    parser.add_argument(
+        "--l4-max-steps-factor",
+        type=float,
+        default=0.0,
+        help="When >0, override --max-steps-factor for L4 tasks only.",
+    )
+    parser.add_argument(
+        "--l5-max-steps-factor",
+        type=float,
+        default=0.0,
+        help="When >0, override --max-steps-factor for L5 tasks only.",
+    )
+    parser.add_argument(
+        "--l6-max-steps-factor",
+        type=float,
+        default=0.0,
+        help="When >0, override --max-steps-factor for L6 tasks only.",
+    )
+    parser.add_argument("--max-iterations", type=int, default=180, help="Hermes max tool/agent iterations for one composite dialogue.")
+    parser.add_argument("--gateway-port", type=int, help="OpenClaw gateway port. Defaults to GATEWAY_PORT or 18789.")
+    parser.add_argument("--openclaw-image-model", help="Optional OpenClaw image model override. Defaults to --model.")
+    parser.add_argument(
+        "--mcp-python-command",
+        help=(
+            "Python executable used inside the agent container for TongSIM MCP servers. "
+            "Defaults to /opt/hermes/.venv/bin/python3 for hermesagent and python3 for openclaw/codex/claudecode."
+        ),
+    )
+    parser.add_argument("--temperature", type=float)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--no-model-seed", action="store_true")
+    parser.add_argument("--no-model-temperature", action="store_true")
+    parser.add_argument("--thinking")
+    parser.add_argument("--responses-non-stream", action="store_true")
+    parser.add_argument(
+        "--context-mode",
+        choices=["full", "task_compact"],
+        default="full",
+        help="Hermes API context projection: full history or compact repeated historical observation images.",
+    )
+    parser.add_argument("--action-interface", choices=["full_action", "factorized", "global_factorized", "library_factorized"], default="library_factorized")
+    parser.add_argument("--action-library-mode", choices=["atomic_only", "subtask_only", "atomic_plus_subtask"], default="atomic_only")
+    parser.add_argument("--public-interface-mode", choices=["structured", "natural_language"], default="natural_language")
+    parser.add_argument(
+        "--protocol-surface",
+        choices=["legacy", "safe_choice"],
+        default="legacy",
+        help="Model-facing protocol surface. legacy preserves raw MCP action/object exposure; safe_choice wraps each step as lettered choices.",
+    )
+    parser.add_argument(
+        "--self-evolution-mode",
+        choices=["in_context", "skill"],
+        default="in_context",
+        help="in_context creates/reuses one native learning checkpoint before the target; skill branches from that same checkpoint to summarize, then starts a fresh target dialogue with the skill.",
+    )
+    parser.add_argument("--skill-word-limit", type=int, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--skill-learning-only",
+        action="store_true",
+        help="In --self-evolution-mode skill, run only the learning phase and write generated_skill.md without applying it to the target task.",
+    )
+    parser.add_argument(
+        "--skill-file",
+        help="In --self-evolution-mode skill, skip learning and apply an existing Markdown skill file to the selected target task.",
+    )
+    parser.add_argument("--choice-count", type=int, default=4, help="Number of model-facing choices in --protocol-surface safe_choice.")
+    parser.add_argument("--choice-seed", type=int, default=0, help="Deterministic seed for safe-choice option order.")
+    parser.add_argument("--choice-bank-jsonl", help="task_id/state_id keyed JSONL option bank for safe_choice.")
+    parser.add_argument("--write-human-trace-md", action="store_true", help="Write per-task human_trace.md reports when supported.")
+    parser.add_argument("--learning-task-id", action="append", default=[], help="Task id to run before the target task for in-context or skill learning. Can be repeated.")
+    parser.add_argument("--learning-plan-json", help="Target-specific learning plan shared by in-context and skill modes.")
+    parser.add_argument(
+        "--reuse-learning-manifest",
+        help=(
+            "Target-to-checkpoint manifest. When set, reuse the listed existing learning checkpoint and "
+            "summary instead of rerunning the learning tasks."
+        ),
+    )
+    parser.add_argument(
+        "--learning-checkpoint-root",
+        help=(
+            "Shared native learning-checkpoint root used by both in_context and skill. "
+            "Run matching in_context tasks before skill tasks."
+        ),
+    )
+    parser.add_argument("--related-learning-ready-json", help="Ready L3 JSON used to choose target-specific in-context learning tasks when --learning-task-id is not provided.")
+    parser.add_argument("--related-learning-max-count", type=int, default=0, help="Maximum number of target-specific related L3 tasks to prepend for in-context learning.")
+    parser.add_argument("--atomic-template-path")
+    parser.add_argument("--subtask-template-path")
+    parser.add_argument("--exclusive-in-view", choices=["true", "false"], default="true")
+    parser.add_argument("--decision-only", action="store_true")
+    parser.add_argument("--generic-invalid-action-feedback", action="store_true")
+    parser.add_argument("--no-image-input", action="store_true", help="Do not attach observation images to the acting model.")
+    parser.add_argument(
+        "--codex-direct-image-input",
+        action="store_true",
+        help=(
+            "For the Codex compositional backend, attach observation images directly in MCP tool results "
+            "instead of using text-only image paths plus .wildclaw_image.py."
+        ),
+    )
+    parser.add_argument(
+        "--codex-mcp-only-tools",
+        action="store_true",
+        help=(
+            "For the Codex backend, route Responses requests through the in-container DashScope adapter "
+            "and forward only TongSIM MCP tools to the model."
+        ),
+    )
+    parser.add_argument(
+        "--mcp-compress-images",
+        action="store_true",
+        help="Compress MCP observation images before returning image content blocks. Disabled by default.",
+    )
+    parser.add_argument(
+        "--mcp-image-max-side",
+        type=int,
+        default=768,
+        help="Max long side in pixels when --mcp-compress-images is enabled.",
+    )
+    parser.add_argument(
+        "--mcp-image-max-base64-chars",
+        type=int,
+        default=70000,
+        help="Target max base64 character count per MCP image when --mcp-compress-images is enabled.",
+    )
+    parser.add_argument(
+        "--mcp-image-jpeg-quality",
+        type=int,
+        default=70,
+        help="Initial JPEG quality when --mcp-compress-images is enabled.",
+    )
+    parser.add_argument(
+        "--decision-diagnostics",
+        action="store_true",
+        help="After each subtask run, write sidecar image/action diagnostics without feeding them back to the acting model.",
+    )
+    parser.add_argument("--task-id", action="append", help="Only run the given composite task_id. Can be repeated.")
+    parser.add_argument("--limit", type=int, help="Limit the number of composite tasks to run after filtering.")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip a composite task when its existing result file is already present.")
+    parser.add_argument("--force", action="store_true", help="Run even when --skip-existing would skip.")
+    parser.add_argument("--parallel-jobs", type=int, default=1, help="Number of composite dialogues to run concurrently.")
+    parser.add_argument("--dry-run", action="store_true", help="Resolve plans and image manifests without launching the agent/Docker.")
+    args = parser.parse_args()
+    args.runtime = activate_runtime(args.runtime)
+    if args.protocol_surface == "safe_choice":
+        args.action_interface = "full_action"
+        if not args.choice_bank_jsonl:
+            raise ValueError("--protocol-surface safe_choice requires --choice-bank-jsonl; generated fallback choices are not allowed for formal runs.")
+    ready_json = Path(args.ready_json).resolve()
+    results_root = _infer_results_root(ready_json, args.results_root)
+    output_root = Path(args.output_dir).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    if not ready_json.exists():
+        raise FileNotFoundError(f"Missing ready JSON: {ready_json}")
+    if not results_root.exists():
+        raise FileNotFoundError(f"Missing results root: {results_root}")
+    resolved_atomic_template_path = _resolve_default_template_path(
+        args.atomic_template_path,
+        "TONGSIM_ATOMIC_TEMPLATE_PATH",
+        UPDATED_ATOMIC_TEMPLATE_NAME,
+        results_root,
+    )
+    resolved_subtask_template_path = _resolve_default_template_path(
+        args.subtask_template_path,
+        "TONGSIM_SUBTASK_TEMPLATE_PATH",
+        UPDATED_SUBTASK_TEMPLATE_NAME,
+        results_root,
+    )
+    args.atomic_template_path = str(resolved_atomic_template_path or "")
+    args.subtask_template_path = str(resolved_subtask_template_path or "")
+
+    items = _load_ready_items(ready_json)
+    selected_task_ids = set(args.task_id or [])
+    if selected_task_ids:
+        items = [item for item in items if str(item.get("task_id") or "") in selected_task_ids]
+    if args.limit is not None:
+        items = items[: int(args.limit)]
+    if not items:
+        raise ValueError("No ready tasks selected.")
+
+    models_config = _load_models_config(Path(args.models_config).resolve()) if args.models_config else None
+    models_config = _apply_provider_overrides(
+        models_config,
+        model=args.model,
+        api_key=args.api_key,
+        base_url=args.base_url,
+    )
+    def write_overall() -> None:
+        overall_payload = {
+            "ready_json": str(ready_json),
+            "results_root": str(results_root),
+            "output_dir": str(output_root),
+            "atomic_template_path": str(args.atomic_template_path or ""),
+            "subtask_template_path": str(args.subtask_template_path or ""),
+            "self_evolution_mode": str(args.self_evolution_mode),
+            "learning_task_ids": _learning_task_ids(args),
+            "learning_checkpoint_root": str(args.learning_checkpoint_root or ""),
+            "related_learning_ready_json": str(args.related_learning_ready_json or ""),
+            "related_learning_max_count": int(args.related_learning_max_count or 0),
+            "skill_learning_only": bool(args.skill_learning_only),
+            "skill_file": str(args.skill_file or ""),
+            "max_steps_extra": args.max_steps_extra,
+            "l1_max_steps_extra": args.l1_max_steps_extra,
+            "l2_max_steps_extra": args.l2_max_steps_extra,
+            "l3_max_steps_extra": args.l3_max_steps_extra,
+            "l4_max_steps_extra": args.l4_max_steps_extra,
+            "l5_max_steps_extra": args.l5_max_steps_extra,
+            "l6_max_steps_extra": args.l6_max_steps_extra,
+            "max_steps_factor": float(args.max_steps_factor or 0),
+            "l1_max_steps_factor": float(args.l1_max_steps_factor or 0),
+            "l2_max_steps_factor": float(args.l2_max_steps_factor or 0),
+            "l3_max_steps_factor": float(args.l3_max_steps_factor or 0),
+            "l4_max_steps_factor": float(args.l4_max_steps_factor or 0),
+            "l5_max_steps_factor": float(args.l5_max_steps_factor or 0),
+            "l6_max_steps_factor": float(args.l6_max_steps_factor or 0),
+            "choice_bank_jsonl": str(args.choice_bank_jsonl or ""),
+            "no_image_input": bool(args.no_image_input),
+            "dry_run": bool(args.dry_run),
+            "task_count": len(summaries),
+            "selected_task_count": len(items),
+            "parallel_jobs": max(1, int(args.parallel_jobs or 1)),
+            "tasks": summaries,
+        }
+        _write_json(output_root / "summary.json", overall_payload)
+
+    def run_item(item: dict[str, Any]) -> dict[str, Any]:
+        return _run_one_dialogue(
+            item=item,
+            results_root=results_root,
+            output_root=output_root,
+            args=args,
+            models_config=models_config,
+        )
+
+    summaries: list[dict[str, Any]] = []
+    exit_code = 0
+    parallel_jobs = max(1, int(args.parallel_jobs or 1))
+    if parallel_jobs == 1:
+        for index, item in enumerate(items, start=1):
+            task_id = str(item.get("task_id") or "unknown")
+            print(f"[{index}/{len(items)}] {task_id}", flush=True)
+            try:
+                summary = run_item(item)
+                summaries.append(summary)
+                if summary.get("error"):
+                    exit_code = 1
+            except Exception as exc:
+                error_summary = {
+                    "task_id": task_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                summaries.append(error_summary)
+                exit_code = 1
+                _write_json(output_root / f"{task_id}_error.json", error_summary)
+            write_overall()
+    else:
+        print(f"Running {len(items)} composite dialogues with parallel_jobs={parallel_jobs}", flush=True)
+        with ThreadPoolExecutor(max_workers=parallel_jobs) as executor:
+            futures = {}
+            for index, item in enumerate(items, start=1):
+                task_id = str(item.get("task_id") or "unknown")
+                print(f"[submit {index}/{len(items)}] {task_id}", flush=True)
+                futures[executor.submit(run_item, item)] = (index, item)
+            for future in as_completed(futures):
+                index, item = futures[future]
+                task_id = str(item.get("task_id") or "unknown")
+                try:
+                    summary = future.result()
+                    summaries.append(summary)
+                    if summary.get("error"):
+                        exit_code = 1
+                except Exception as exc:
+                    error_summary = {
+                        "task_id": task_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    summaries.append(error_summary)
+                    exit_code = 1
+                    _write_json(output_root / f"{task_id}_error.json", error_summary)
+                print(f"[done {index}/{len(items)}] {task_id}", flush=True)
+                write_overall()
+
+    overall = {
+        "ready_json": str(ready_json),
+        "results_root": str(results_root),
+        "output_dir": str(output_root),
+        "atomic_template_path": str(args.atomic_template_path or ""),
+        "subtask_template_path": str(args.subtask_template_path or ""),
+        "self_evolution_mode": str(args.self_evolution_mode),
+        "learning_task_ids": _learning_task_ids(args),
+        "learning_checkpoint_root": str(args.learning_checkpoint_root or ""),
+        "related_learning_ready_json": str(args.related_learning_ready_json or ""),
+    "related_learning_max_count": int(args.related_learning_max_count or 0),
+    "skill_learning_only": bool(args.skill_learning_only),
+    "skill_file": str(args.skill_file or ""),
+    "max_steps_extra": args.max_steps_extra,
+    "l1_max_steps_extra": args.l1_max_steps_extra,
+    "l2_max_steps_extra": args.l2_max_steps_extra,
+    "l3_max_steps_extra": args.l3_max_steps_extra,
+    "l4_max_steps_extra": args.l4_max_steps_extra,
+    "l5_max_steps_extra": args.l5_max_steps_extra,
+    "l6_max_steps_extra": args.l6_max_steps_extra,
+    "max_steps_factor": float(args.max_steps_factor or 0),
+    "l1_max_steps_factor": float(args.l1_max_steps_factor or 0),
+    "l2_max_steps_factor": float(args.l2_max_steps_factor or 0),
+        "l3_max_steps_factor": float(args.l3_max_steps_factor or 0),
+    "l4_max_steps_factor": float(args.l4_max_steps_factor or 0),
+    "l5_max_steps_factor": float(args.l5_max_steps_factor or 0),
+    "l6_max_steps_factor": float(args.l6_max_steps_factor or 0),
+        "choice_bank_jsonl": str(args.choice_bank_jsonl or ""),
+        "no_image_input": bool(args.no_image_input),
+        "dry_run": bool(args.dry_run),
+        "task_count": len(summaries),
+        "selected_task_count": len(items),
+        "parallel_jobs": parallel_jobs,
+        "tasks": summaries,
+    }
+    _write_json(output_root / "summary.json", overall)
+    print(json.dumps(overall, indent=2, ensure_ascii=False))
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

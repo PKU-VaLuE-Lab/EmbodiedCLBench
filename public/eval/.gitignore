@@ -1,0 +1,60 @@
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+*.tar
+*.zip
+*.gz
+*.7z
+
+*.tar.gz
+*.pth
+*.pkl
+*.ckpt
+*.bin
+*.onnx
+.env
+
+# 忽略所有图片格式
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+
+Images/
+_workspace/
+workspace/
+
+# The framework workspace runtime is required by the public evaluation CLI.
+!src/tongbench_eval/graph_env/workspace/
+!src/tongbench_eval/graph_env/workspace/**
+src/tongbench_eval/graph_env/workspace/**/__pycache__/
+script/
+tools/
+output/
+output_sum/
+output_qwen/
+# output*/
+.cache/
+.hfd/
+hfd.sh
+grocery/
+tmp/
+# outputs/
+.venv/
+# *.log
+
+cookies.txt
+output.rar
+output_qwen.rar
+*.rar
+tests/fixtures/task_L3_001/task_L3_control_001.json
+tests/fixtures/task_03/task_03.json

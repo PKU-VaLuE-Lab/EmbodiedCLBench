@@ -1,0 +1,6 @@
+data/
+docker_images/
+output/
+.DS_Store
+*.log
+models_*.json
