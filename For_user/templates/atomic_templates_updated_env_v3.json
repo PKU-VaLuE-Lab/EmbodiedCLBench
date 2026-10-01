@@ -1,0 +1,291 @@
+{
+  "scene": "daily_life_scene",
+  "active_actions": [
+    "pick_up",
+    "place",
+    "open",
+    "close",
+    "pour",
+    "switch_on",
+    "switch_off",
+    "hang_object",
+    "hand_over",
+    "cut",
+    "plug_in",
+    "unplug",
+    "drop",
+    "look_at",
+    "walk_to",
+    "turn",
+    "stand_up"
+  ],
+  "templates": [
+    {
+      "template_id": "look_at_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "look_at"
+      ],
+      "task_description": "Look at an object until it enters view.",
+      "pre_state": [
+        "exists({object})"
+      ],
+      "post_state": [
+        "in_view({object})"
+      ]
+    },
+    {
+      "template_id": "walk_to_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "walk_to"
+      ],
+      "task_description": "Walk to an object that is already in view until it becomes reachable.",
+      "pre_state": [
+        "in_view({object})"
+      ],
+      "post_state": [
+        "with_reach({object})"
+      ]
+    },
+    {
+      "template_id": "pick_up_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "pick_up"
+      ],
+      "task_description": "Pick up a pickable object that is within reach.",
+      "pre_state": [
+        "with_reach({object})",
+        "empty"
+      ],
+      "post_state": [
+        "holding({object})"
+      ]
+    },
+    {
+      "template_id": "place_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "place"
+      ],
+      "task_description": "Place a currently held object.",
+      "pre_state": [
+        "holding({object})"
+      ],
+      "post_state": [
+        "empty"
+      ]
+    },
+    {
+      "template_id": "place_{object1}_on_{object2}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "place"
+      ],
+      "task_description": "Place a held object onto a target surface object.",
+      "pre_state": [
+        "with_reach({object2})",
+        "holding({object1})"
+      ],
+      "post_state": [
+        "on({object1},{object2})",
+        "empty"
+      ]
+    },
+    {
+      "template_id": "place_{object1}_in_{object2}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "place"
+      ],
+      "task_description": "Place a held object into a target container object.",
+      "pre_state": [
+        "with_reach({object2})",
+        "holding({object1})"
+      ],
+      "post_state": [
+        "in({object1},{object2})",
+        "empty"
+      ]
+    },
+    {
+      "template_id": "drop_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "drop"
+      ],
+      "task_description": "Drop a currently held object.",
+      "pre_state": [
+        "holding({object})"
+      ],
+      "post_state": [
+        "empty"
+      ]
+    },
+    {
+      "template_id": "open_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "open"
+      ],
+      "task_description": "Open an openable object that is within reach.",
+      "pre_state": [
+        "with_reach({object})",
+        "closed({object})"
+      ],
+      "post_state": [
+        "open({object})"
+      ]
+    },
+    {
+      "template_id": "close_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "close"
+      ],
+      "task_description": "Close an openable object that is within reach.",
+      "pre_state": [
+        "with_reach({object})",
+        "open({object})"
+      ],
+      "post_state": [
+        "closed({object})"
+      ]
+    },
+    {
+      "template_id": "switch_on_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "switch_on"
+      ],
+      "task_description": "Switch on a powerable object that is within reach.",
+      "pre_state": [
+        "with_reach({object})",
+        "powered_off({object})"
+      ],
+      "post_state": [
+        "powered_on({object})"
+      ]
+    },
+    {
+      "template_id": "switch_off_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "switch_off"
+      ],
+      "task_description": "Switch off a powerable object that is within reach.",
+      "pre_state": [
+        "with_reach({object})",
+        "powered_on({object})"
+      ],
+      "post_state": [
+        "powered_off({object})"
+      ]
+    },
+    {
+      "template_id": "pour_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "pour"
+      ],
+      "task_description": "Pour from a held container-like object.",
+      "pre_state": [
+        "holding({object})",
+        "filled({object})"
+      ],
+      "post_state": [
+        "holding({object})",
+        "empty({object})"
+      ]
+    },
+    {
+      "template_id": "hang_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "hang_object"
+      ],
+      "task_description": "Hang a currently held object.",
+      "pre_state": [
+        "holding({object})"
+      ],
+      "post_state": [
+        "empty"
+      ]
+    },
+    {
+      "template_id": "hand_over_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "hand_over"
+      ],
+      "task_description": "Hand over a currently held object.",
+      "pre_state": [
+        "holding({object})"
+      ],
+      "post_state": [
+        "empty"
+      ]
+    },
+    {
+      "template_id": "cut_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "cut"
+      ],
+      "task_description": "Cut a reachable cuttable object while holding a knife.",
+      "pre_state": [
+        "with_reach({object})",
+        "holding(knife)"
+      ],
+      "post_state": [
+        "cut({object})",
+        "holding(knife)"
+      ]
+    },
+    {
+      "template_id": "plug_in_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "plug_in"
+      ],
+      "task_description": "Plug in a reachable pluggable object.",
+      "pre_state": [
+        "with_reach({object})",
+        "unplugged({object})"
+      ],
+      "post_state": [
+        "plugged_in({object})"
+      ]
+    },
+    {
+      "template_id": "unplug_{object}",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "unplug"
+      ],
+      "task_description": "Unplug a reachable pluggable object.",
+      "pre_state": [
+        "with_reach({object})",
+        "plugged_in({object})"
+      ],
+      "post_state": [
+        "unplugged({object})"
+      ]
+    },
+    {
+      "template_id": "stand_up",
+      "scene": "daily_life_scene",
+      "action_space": [
+        "stand_up"
+      ],
+      "task_description": "Stand up from a seated posture.",
+      "pre_state": [
+        "sitting"
+      ],
+      "post_state": [
+        "standing"
+      ]
+    }
+  ]
+}

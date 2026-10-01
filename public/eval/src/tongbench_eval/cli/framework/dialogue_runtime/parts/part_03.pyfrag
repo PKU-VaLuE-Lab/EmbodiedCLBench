@@ -1,0 +1,1073 @@
+def _attach_status_if_terminal(step: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    if _is_terminal_result(step, result):
+        return _finish_and_advance(step, result)
+    status = _run_client(step, "status")
+    if _is_terminal_result(step, status):
+        return _finish_and_advance(step, {{**result, "status_before_auto_finish": status}})
+    return result
+
+
+def _run_client(step: dict[str, Any], command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    workspace = Path(step["workspace"])
+    client = workspace / "tongsim_client.py"
+    args = [current_python(), str(client), command]
+    temp_path: Path | None = None
+    if command == "act":
+        if os.environ.get("TONGBENCH_RUNTIME", "docker").strip().lower() == "native":
+            temp_dir = Path(native_path(str(step["task_id"]), "/tmp_workspace")) / "tmp"
+        else:
+            temp_dir = Path("/tmp_workspace") / "tmp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = temp_dir / f"tongsim_sequence_decision_{{uuid.uuid4().hex}}.json"
+        temp_path.write_text(json.dumps(payload or {{}}, ensure_ascii=False), encoding="utf-8")
+        args.extend(["--decision-json", str(temp_path)])
+    completed = subprocess.run(args, cwd=str(workspace), capture_output=True, text=True, encoding="utf-8", timeout=120)
+    if temp_path is not None:
+        temp_path.unlink(missing_ok=True)
+    if completed.returncode != 0:
+        raise RuntimeError((completed.stderr or completed.stdout or "TongSIM client failed").strip())
+    return json.loads(completed.stdout)
+
+
+def _canonical_action_type_for_template(template_id: str) -> str | None:
+    return {{
+        "look_at_{{object}}": "look_at",
+        "point_at_{{object}}": "point_at",
+        "walk_to_{{object}}": "walk_to",
+        "pick_up_{{object}}": "pick_up",
+        "place_{{object}}": "place",
+        "place_{{object1}}_on_{{object2}}": "place",
+        "place_{{object1}}_in_{{object2}}": "place",
+        "drop_{{object}}": "drop",
+        "open_{{object}}": "open",
+        "close_{{object}}": "close",
+        "switch_on_{{object}}": "switch_on",
+        "switch_off_{{object}}": "switch_off",
+        "pour_{{object}}": "pour",
+        "hang_{{object}}": "hang_object",
+        "hand_over_{{object}}": "hand_over",
+        "cut_{{object}}": "cut",
+        "plug_in_{{object}}": "plug_in",
+        "unplug_{{object}}": "unplug",
+        "wash_{{object}}": "wash_object",
+    }}.get(template_id)
+
+
+def _normalize_action_type_for_template(template_id: str, action_type: str) -> str:
+    normalized_action_type = str(action_type or "").strip()
+    canonical_action_type = _canonical_action_type_for_template(template_id)
+    if canonical_action_type is None:
+        return normalized_action_type
+    if not normalized_action_type or normalized_action_type in {{
+        "atomic",
+        "subtask",
+        "action",
+        "environment_action",
+        "tool_action",
+    }}:
+        return canonical_action_type
+    template_prefix = template_id.split("{{", 1)[0]
+    if (
+        normalized_action_type == template_id
+        or "{{" in normalized_action_type
+        or "}}" in normalized_action_type
+        or (template_prefix and normalized_action_type.startswith(template_prefix))
+    ):
+        return canonical_action_type
+    return normalized_action_type
+
+
+def _normalize_instantiated_place_template(
+    template_id: str,
+    role_bindings: dict[str, str],
+) -> dict[str, Any] | None:
+    if not template_id.startswith("place_"):
+        return None
+    remainder = template_id[len("place_") :]
+    for relation in ("_on_", "_in_"):
+        if relation not in remainder:
+            continue
+        object1, object2 = remainder.split(relation, 1)
+        if not object1 or not object2:
+            continue
+        roles = dict(role_bindings)
+        roles.setdefault("object1", object1)
+        roles.setdefault("object2", object2)
+        return {{
+            "template_id": f"place_{{{{object1}}}}{{relation}}{{{{object2}}}}",
+            "role_bindings": roles,
+        }}
+    return None
+
+
+def _normalize_instantiated_single_object_template(
+    template_id: str,
+    action_type: str,
+    role_bindings: dict[str, str],
+) -> dict[str, Any] | None:
+    patterns = [
+        ("look_at_", "look_at_{{object}}", "look_at"),
+        ("point_at_", "point_at_{{object}}", "point_at"),
+        ("walk_to_", "walk_to_{{object}}", "walk_to"),
+        ("pick_up_", "pick_up_{{object}}", "pick_up"),
+        ("drop_", "drop_{{object}}", "drop"),
+        ("open_", "open_{{object}}", "open"),
+        ("close_", "close_{{object}}", "close"),
+        ("switch_on_", "switch_on_{{object}}", "switch_on"),
+        ("switch_off_", "switch_off_{{object}}", "switch_off"),
+        ("pour_", "pour_{{object}}", "pour"),
+        ("hang_", "hang_{{object}}", "hang_object"),
+        ("hand_over_", "hand_over_{{object}}", "hand_over"),
+        ("cut_", "cut_{{object}}", "cut"),
+        ("plug_in_", "plug_in_{{object}}", "plug_in"),
+        ("unplug_", "unplug_{{object}}", "unplug"),
+        ("wash_", "wash_{{object}}", "wash_object"),
+    ]
+    for prefix, canonical_template, canonical_action_type in patterns:
+        if not template_id.startswith(prefix):
+            continue
+        object_id = template_id[len(prefix) :].strip()
+        roles = dict(role_bindings)
+        if object_id:
+            roles.setdefault("object", object_id)
+        return {{
+            "template_id": canonical_template,
+            "action_type": action_type or canonical_action_type,
+            "role_bindings": roles,
+        }}
+    return None
+
+
+def _normalize_role_bindings_value(value: Any) -> dict[str, str]:
+    def normalize_key(raw_key: Any) -> str:
+        key = str(raw_key).strip()
+        while key.startswith("{{") and key.endswith("}}") and len(key) > 2:
+            inner = key[1:-1].strip()
+            if not inner or inner == key:
+                break
+            key = inner
+        return key
+
+    def add_role(roles: dict[str, str], raw_key: Any, raw_value: Any) -> None:
+        key = normalize_key(raw_key)
+        value_text = str(raw_value).strip()
+        if not key or not value_text:
+            return
+        raw_key_text = str(raw_key).strip()
+        if key in roles and raw_key_text != key:
+            return
+        roles[key] = value_text
+
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return {{}}
+        try:
+            value = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed_roles: dict[str, str] = {{}}
+            chunks = [chunk.strip() for chunk in stripped.replace(";", ",").split(",")]
+            for chunk in chunks:
+                if "=" not in chunk:
+                    continue
+                key, raw_value = chunk.split("=", 1)
+                key = key.strip()
+                raw_value = raw_value.strip()
+                if key and raw_value:
+                    add_role(parsed_roles, key, raw_value)
+            return parsed_roles
+    if not isinstance(value, dict):
+        return {{}}
+    normalized_roles: dict[str, str] = {{}}
+    for key, raw_value in value.items():
+        add_role(normalized_roles, key, raw_value)
+    return normalized_roles
+
+
+def _normalize_selected_action_fields(
+    *,
+    template_id: str,
+    action_type: str,
+    role_bindings: Any,
+) -> dict[str, Any]:
+    normalized_template = str(template_id or "").strip()
+    normalized_action_type = str(action_type or "").strip()
+    normalized_roles = _normalize_role_bindings_value(role_bindings)
+
+    if "{{" in normalized_template and "}}" in normalized_template:
+        return {{
+            "template_id": normalized_template,
+            "action_type": _normalize_action_type_for_template(normalized_template, normalized_action_type),
+            "role_bindings": normalized_roles,
+        }}
+
+    place_match = _normalize_instantiated_place_template(normalized_template, normalized_roles)
+    if place_match is not None:
+        return {{
+            "template_id": place_match["template_id"],
+            "action_type": _normalize_action_type_for_template(place_match["template_id"], normalized_action_type),
+            "role_bindings": place_match["role_bindings"],
+        }}
+
+    single_match = _normalize_instantiated_single_object_template(
+        normalized_template,
+        normalized_action_type,
+        normalized_roles,
+    )
+    if single_match is not None:
+        return {{
+            "template_id": single_match["template_id"],
+            "action_type": _normalize_action_type_for_template(
+                single_match["template_id"],
+                normalized_action_type or single_match["action_type"],
+            ),
+            "role_bindings": single_match["role_bindings"],
+        }}
+
+    return {{
+        "template_id": normalized_template,
+        "action_type": normalized_action_type,
+        "role_bindings": normalized_roles,
+    }}
+
+
+def _decision_payload(
+    template_id: str,
+    role_bindings: dict[str, str],
+    action_type: str = "",
+    brief_reason: str = "",
+    perceived_state_predicates: Any = None,
+    uncertain_predicates: Any = None,
+    visual_evidence: Any = None,
+) -> dict[str, Any]:
+    normalized_action = _normalize_selected_action_fields(
+        template_id=template_id,
+        action_type=action_type,
+        role_bindings=role_bindings,
+    )
+    return {{
+        "perceived_state_predicates": perceived_state_predicates or [],
+        "uncertain_predicates": uncertain_predicates or [],
+        "visual_evidence": visual_evidence or [],
+        "selected_action": {{
+            "action_level": "atomic",
+            "template_id": normalized_action["template_id"],
+            "action_type": normalized_action["action_type"],
+            "role_bindings": normalized_action["role_bindings"],
+        }},
+        "brief_reason": brief_reason or "",
+    }}
+
+
+mcp = FastMCP("tongsim_sequence")
+
+
+@mcp.tool(
+    name="observe_current_state",
+    description="Observe the current unfinished TongSIM task in the required sequence. Call at most one TongSIM tool per assistant response, then wait for the tool result.",
+)
+def observe_current_state() -> Any:
+    step = _current_step()
+    if step is None:
+        return _content_response_with_images(_with_sequence_context({{"done": True, "message": "All tasks are complete. Stop using task tools."}}, None))
+    result = _attach_status_if_terminal(step, _run_client(step, "observe"))
+    return _content_response_with_images(_with_sequence_context(result, _current_step()))
+
+
+@mcp.tool(
+    name="choose_action",
+    description="Submit one action to the current unfinished TongSIM task only. Use template_id and role_bindings from the latest observation. Call at most one TongSIM tool per assistant response, then wait for the tool result.",
+)
+def choose_action(
+    template_id: str,
+    role_bindings: dict[str, str],
+    action_type: str = "",
+    brief_reason: str = "",
+    perceived_state_predicates: Any = None,
+    uncertain_predicates: Any = None,
+    visual_evidence: Any = None,
+) -> Any:
+    step = _current_step()
+    if step is None:
+        return _content_response_with_images(_with_sequence_context({{"accepted": False, "done": True, "action_feedback": "All tasks are complete. Stop using task tools."}}, None))
+    result = _run_client(
+        step,
+        "act",
+        _decision_payload(
+            template_id=template_id,
+            role_bindings=role_bindings,
+            action_type=action_type,
+            brief_reason=brief_reason,
+            perceived_state_predicates=perceived_state_predicates,
+            uncertain_predicates=uncertain_predicates,
+            visual_evidence=visual_evidence,
+        ),
+    )
+    result = _attach_status_if_terminal(step, result)
+    return _content_response_with_images(_with_sequence_context(result, _current_step()))
+
+
+@mcp.tool(
+    name="check_task_status",
+    description="Check status for the current unfinished task in the required sequence. Call at most one TongSIM tool per assistant response, then wait for the tool result.",
+)
+def check_task_status() -> Any:
+    step = _current_step()
+    if step is None:
+        return _content_response_with_images(_with_sequence_context({{"done": True, "step_count": 0}}, None))
+    result = _attach_status_if_terminal(step, _run_client(step, "status"))
+    return _content_response_with_images(_with_sequence_context(result, _current_step()))
+
+
+if __name__ == "__main__":
+    mcp.run()
+'''
+    script_path = public_exec_workspace / "tongsim_sequence_mcp_server.py"
+    script_path.write_text(script, encoding="utf-8")
+    return script_path
+
+
+def _apply_mcp_image_compression_env(env: dict[str, str], args: argparse.Namespace) -> None:
+    if not bool(getattr(args, "mcp_compress_images", False)):
+        return
+    env["TONGSIM_MCP_COMPRESS_IMAGES"] = "1"
+    if getattr(args, "mcp_image_max_side", None) is not None:
+        env["TONGSIM_MCP_IMAGE_MAX_SIDE"] = str(int(args.mcp_image_max_side))
+    if getattr(args, "mcp_image_max_base64_chars", None) is not None:
+        env["TONGSIM_MCP_IMAGE_MAX_BASE64_CHARS"] = str(int(args.mcp_image_max_base64_chars))
+    if getattr(args, "mcp_image_jpeg_quality", None) is not None:
+        env["TONGSIM_MCP_IMAGE_JPEG_QUALITY"] = str(int(args.mcp_image_jpeg_quality))
+
+
+def _codex_sequence_mcp_servers(
+    python_command: str,
+    *,
+    direct_image_input: bool = False,
+    args: argparse.Namespace | None = None,
+) -> dict[str, Any]:
+    env = {"TONGSIM_MCP_EXPOSE_IMAGE_PATHS": "1"}
+    if not direct_image_input:
+        env["TONGSIM_MCP_TEXT_ONLY"] = "1"
+    if args is not None:
+        _apply_mcp_image_compression_env(env, args)
+    return _codex_mcp_servers(
+        {
+            "tongsim_sequence": {
+                "command": python_command,
+                "args": ["/tmp_workspace/tongsim_sequence_mcp_server.py"],
+                "env": env,
+                "timeout": 120,
+                "connect_timeout": 60,
+            }
+        }
+    )
+
+
+def _stop_bridges(processes: list[subprocess.Popen[str]], steps: list[DialogueStep]) -> None:
+    for step in steps:
+        if step.session is None:
+            continue
+        try:
+            Path(step.session.bridge_dir, "STOP").write_text("stop\n", encoding="utf-8")
+        except Exception:
+            pass
+    for proc in processes:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
+def _export_step_outputs(runtime: TongSimFrameworkRuntime, steps: list[DialogueStep]) -> list[dict[str, Any]]:
+    exported: list[dict[str, Any]] = []
+    for step in steps:
+        if step.session is None:
+            continue
+        result = runtime.export_outputs(step.session.session_id, step.output_dir)
+        exported.append(
+            {
+                "index": step.index,
+                "task_id": step.task_id,
+                "level": step.level,
+                "max_steps": step.max_steps,
+                "output_dir": str(step.output_dir.resolve()),
+                "score": result.get("score", {}),
+                "grade": result.get("grade", {}),
+            }
+        )
+    return exported
+
+
+def _codex_outer_retry_reason(error: Any) -> str | None:
+    text = str(error or "").lower()
+    for reason, markers in CODEX_OUTER_RETRY_ERROR_MARKERS:
+        if any(marker in text for marker in markers):
+            return reason
+    return None
+
+
+def _archive_retry_attempt(run_dir: Path, output_root: Path, composite_task_id: str, attempt_index: int) -> Path | None:
+    if not run_dir.exists():
+        return None
+    archive_root = output_root / "_retry_attempts"
+    archive_root.mkdir(parents=True, exist_ok=True)
+    archive_dir = archive_root / f"{_safe_slug(composite_task_id)}_attempt{attempt_index}_{uuid.uuid4().hex[:8]}"
+    shutil.move(str(run_dir), str(archive_dir))
+    return archive_dir
+
+
+def _clear_existing_run_dir(run_dir: Path, output_root: Path) -> None:
+    if not run_dir.exists():
+        return
+    resolved_run_dir = run_dir.resolve()
+    resolved_output_root = output_root.resolve()
+    if resolved_run_dir == resolved_output_root or resolved_output_root not in resolved_run_dir.parents:
+        raise ValueError(f"Refusing to clear unexpected run directory: {resolved_run_dir}")
+    shutil.rmtree(resolved_run_dir)
+
+
+def _safe_choice_skill_learning_prompt(
+    steps: list[DialogueStep],
+    *,
+    args: argparse.Namespace,
+) -> str:
+    return _build_sequence_prompt(
+        steps,
+        backend=args.backend,
+        codex_direct_image_input=bool(args.codex_direct_image_input),
+        description_field=args.description_field,
+        hide_decomposition=bool(args.hide_decomposition),
+        protocol_surface=args.protocol_surface,
+    )
+
+
+def _safe_choice_skill_summary_prompt() -> str:
+    return (
+        "Based on your interaction experience, write a skill description in Markdown format. "
+        "This description will be used later to solve more complex tasks. "
+        "Keep the description at or below 1000 English words. "
+        "Return the Markdown directly in your response; do not call tools or read/write files."
+    )
+
+
+def _safe_choice_checkpoint_application_prompt() -> str:
+    return (
+        "Use the preceding interactions as learning examples to help you solve the new task. "
+        "They are reference experience, not the current task, and their ending does not mean "
+        "that the new task is complete.\n\n"
+        "A new task starts now and is not complete yet. First call observe for the new task. "
+        "Then choose exactly one action option per turn and wait for its result. Continue until "
+        "this new task's environment result reports task_complete=true. Do not give a final answer "
+        "before then."
+    )
+
+
+def _directory_content_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    files = sorted(path for path in root.rglob("*") if path.is_file())
+    for path in files:
+        relative = path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_sha256_file(path).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _learning_checkpoint_metadata(
+    *,
+    target_task_id: str,
+    learning_steps: list[DialogueStep],
+    prompt: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    file_inputs: dict[str, Any] = {}
+    for name, raw_path in (
+        ("choice_bank", getattr(args, "choice_bank_jsonl", "")),
+        ("atomic_template", getattr(args, "atomic_template_path", "")),
+        ("subtask_template", getattr(args, "subtask_template_path", "")),
+        ("learning_plan", getattr(args, "learning_plan_json", "")),
+    ):
+        path_text = str(raw_path or "").strip()
+        if not path_text:
+            continue
+        path = Path(path_text).expanduser().resolve()
+        file_inputs[name] = {
+            "path": str(path),
+            "sha256": _sha256_file(path),
+        }
+    step_inputs = []
+    for step in learning_steps:
+        step_inputs.append(
+            {
+                "index": step.index,
+                "task_id": step.task_id,
+                "level": step.level,
+                "max_steps": step.max_steps,
+                "graph_path": str(step.graph_path.resolve()),
+                "graph_sha256": _sha256_file(step.graph_path.resolve()),
+                "image_dir": str(step.unique_state_image_dir.resolve()),
+                "image_content_sha256": _directory_content_digest(
+                    step.unique_state_image_dir.resolve()
+                ),
+            }
+        )
+    identity = {
+        "schema_version": "tongbench_learning_prefix_v1",
+        "target_task_id": _learning_group_id(args, target_task_id),
+        "requested_target_task_id": target_task_id,
+        "backend": str(args.backend),
+        "model": str(args.model),
+        "thinking": str(args.thinking or ""),
+        "temperature": args.temperature,
+        "seed": args.seed,
+        "description_field": str(args.description_field),
+        "hide_decomposition": bool(args.hide_decomposition),
+        "protocol_surface": str(args.protocol_surface),
+        "choice_count": int(args.choice_count),
+        "choice_seed": int(args.choice_seed),
+        "generic_invalid_action_feedback": bool(args.generic_invalid_action_feedback),
+        "no_image_input": bool(args.no_image_input),
+        "mcp_compress_images": bool(args.mcp_compress_images),
+        "prompt": prompt,
+        "prompt_sha256": _sha256_text(prompt),
+        "files": file_inputs,
+        "steps": step_inputs,
+    }
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return {
+        **identity,
+        "fingerprint_sha256": _sha256_text(canonical),
+    }
+
+
+def _learning_checkpoint_bundle_dir(
+    *,
+    args: argparse.Namespace,
+    output_root: Path,
+    target_task_id: str,
+) -> Path:
+    configured_root = str(getattr(args, "learning_checkpoint_root", "") or "").strip()
+    root = (
+        Path(configured_root).expanduser().resolve()
+        if configured_root
+        else (output_root / "_shared_learning_checkpoints").resolve()
+    )
+    group_id = _learning_group_id(args, target_task_id)
+    return root / _safe_slug(args.backend) / _safe_slug(args.model) / _safe_slug(group_id)
+
+
+def _safe_choice_skill_application_prompt(
+    steps: list[DialogueStep],
+    *,
+    args: argparse.Namespace,
+    skill_text: str,
+) -> str:
+    return _build_sequence_prompt(
+        steps,
+        backend=args.backend,
+        codex_direct_image_input=bool(args.codex_direct_image_input),
+        description_field=args.description_field,
+        hide_decomposition=bool(args.hide_decomposition),
+        protocol_surface=args.protocol_surface,
+        skill_text=skill_text,
+    )
+
+
+def _assistant_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    text = str(item.get("text") or "").strip()
+                    if text:
+                        chunks.append(text)
+            else:
+                text = str(item).strip()
+                if text:
+                    chunks.append(text)
+        return "\n\n".join(chunks).strip()
+    if isinstance(content, dict):
+        text = str(content.get("text") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _extract_final_assistant_text(chat_path: Path) -> str:
+    if not chat_path.exists():
+        return ""
+    final_text = ""
+    for raw_line in chat_path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip():
+            continue
+        try:
+            payload = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        message = payload.get("message") if isinstance(payload, dict) else None
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        text = _assistant_content_text(message.get("content"))
+        if text:
+            final_text = text
+    return final_text.strip()
+
+
+def _skill_word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9_]+(?:[-'][A-Za-z0-9_]+)?", text))
+
+
+def _extract_skill_text_for_backend(backend: str, raw_output: Any) -> str:
+    backend_name = str(backend or "").strip()
+    if backend_name == "hermesagent":
+        from tongbench_eval.agents.hermesagent.skill_text import extract_skill_text
+    elif backend_name == "codex":
+        from tongbench_eval.agents.codex.skill_text import extract_skill_text
+    elif backend_name == "claudecode":
+        from tongbench_eval.agents.claudecode.skill_text import extract_skill_text
+    elif backend_name == "openclaw":
+        from tongbench_eval.agents.openclaw.skill_text import extract_skill_text
+    else:
+        raise ValueError(f"Unsupported backend for Skill extraction: {backend_name!r}")
+    return extract_skill_text(raw_output)
+
+def _write_generated_skill(learning_dir: Path, *, backend: str) -> dict[str, Any]:
+    post_task_result_path = learning_dir / "post_task_result.json"
+    skill_text = ""
+    post_task_error = ""
+    if post_task_result_path.exists():
+        try:
+            post_task_result = _read_json(post_task_result_path)
+        except Exception as exc:
+            post_task_error = f"Failed to read post-task skill result: {type(exc).__name__}: {exc}"
+        else:
+            skill_text = _extract_skill_text_for_backend(backend, post_task_result.get("final_response"))
+            post_task_error = str(post_task_result.get("error") or "").strip()
+    skill_path = learning_dir / "generated_skill.md"
+    skill_path.write_text(skill_text + ("\n" if skill_text else ""), encoding="utf-8")
+    word_count = _skill_word_count(skill_text)
+    summary = {
+        "skill_path": str(skill_path.resolve()),
+        "chat_path": str((learning_dir / "chat.jsonl").resolve()),
+        "post_task_result_path": str(post_task_result_path.resolve()),
+        "word_count": word_count,
+        "extracted": bool(skill_text),
+        "backend": backend,
+        "skill_chars": len(skill_text),
+        "skill_sha256": _sha256_text(skill_text) if skill_text else "",
+    }
+    if not skill_text:
+        summary["error"] = post_task_error or "No skill text was returned by the post-task summary call."
+    _write_json(learning_dir / "skill_summary.json", summary)
+    return {**summary, "skill_text": skill_text}
+
+
+def _load_existing_skill_summary(output_root: Path, composite_task_id: str) -> dict[str, Any] | None:
+    path = output_root / composite_task_id / "skill_mode_summary.json"
+    if not path.exists():
+        return None
+    try:
+        payload = _read_json(path)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return {
+        **payload,
+        "task_id": str(payload.get("task_id") or composite_task_id),
+        "status": "skipped_existing",
+        "skipped_existing": True,
+        "existing_result_path": str(path.resolve()),
+    }
+
+
+def _existing_summary_has_valid_learning_checkpoint(
+    summary: dict[str, Any],
+    *,
+    backend: str,
+) -> bool:
+    checkpoint_payload = summary.get("learning_checkpoint")
+    if not isinstance(checkpoint_payload, dict):
+        return False
+    checkpoint_path = str(checkpoint_payload.get("path") or "").strip()
+    if not checkpoint_path:
+        return False
+    try:
+        checkpoint = AgentCheckpoint.load(
+            Path(checkpoint_path).expanduser(),
+            expected_backend=backend,
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    recorded_digest = str(checkpoint_payload.get("payload_sha256") or "").strip()
+    return not recorded_digest or checkpoint.payload_sha256 == recorded_digest
+
+
+def _run_one_dialogue_attempt(
+    *,
+    item: dict[str, Any],
+    results_root: Path,
+    run_dir: Path,
+    args: argparse.Namespace,
+    models_config: dict[str, Any] | None,
+    steps: list[DialogueStep] | None = None,
+    prompt: str | None = None,
+    post_task_prompt: str | None = None,
+    phase: str = "in_context",
+    learning_task_ids: list[str] | None = None,
+    related_learning_selection: dict[str, Any] | None = None,
+    resume_checkpoint: AgentCheckpoint | None = None,
+    resume_without_prompt: bool = False,
+    export_checkpoint_dir: Path | None = None,
+    checkpoint_metadata: dict[str, Any] | None = None,
+    tools_enabled: bool = True,
+    context_mode_override: str | None = None,
+    disable_context_compression: bool = False,
+) -> dict[str, Any]:
+    composite_task_id = str(item.get("task_id") or "").strip()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    effective_context_mode = str(
+        context_mode_override or getattr(args, "context_mode", "full") or "full"
+    ).strip()
+    if effective_context_mode not in {"full", "task_compact"}:
+        raise ValueError(f"Unsupported context mode override: {effective_context_mode!r}")
+
+    if steps is None:
+        steps = _build_dialogue_steps(
+            item=item,
+            results_root=results_root,
+            run_dir=run_dir,
+            l1_max_steps=int(args.l1_max_steps),
+            l2_max_steps=int(args.l2_max_steps),
+            l3_max_steps=int(args.l3_max_steps),
+            l4_max_steps=int(args.l4_max_steps),
+            l5_max_steps=int(args.l5_max_steps),
+            l6_max_steps=int(args.l6_max_steps),
+            max_steps_factor=float(args.max_steps_factor or 0),
+            l2_max_steps_factor=float(args.l2_max_steps_factor or 0),
+            l3_max_steps_factor=float(args.l3_max_steps_factor or 0),
+            l4_max_steps_factor=float(args.l4_max_steps_factor or 0),
+            l5_max_steps_factor=float(args.l5_max_steps_factor or 0),
+            l6_max_steps_factor=float(args.l6_max_steps_factor or 0),
+            max_steps_extra=args.max_steps_extra,
+            l1_max_steps_extra=args.l1_max_steps_extra,
+            l2_max_steps_extra=args.l2_max_steps_extra,
+            l3_max_steps_extra=args.l3_max_steps_extra,
+            l4_max_steps_extra=args.l4_max_steps_extra,
+            l5_max_steps_extra=args.l5_max_steps_extra,
+            l6_max_steps_extra=args.l6_max_steps_extra,
+            hide_decomposition=bool(args.hide_decomposition),
+        )
+    if prompt is None:
+        prompt = _build_sequence_prompt(
+            steps,
+            backend=args.backend,
+            codex_direct_image_input=bool(args.codex_direct_image_input),
+            description_field=args.description_field,
+            hide_decomposition=bool(args.hide_decomposition),
+            protocol_surface=args.protocol_surface,
+        )
+    openclaw_multi_server = len(steps) > 1
+    _write_json(
+        run_dir / "dialogue_plan.json",
+        {
+            "task_id": composite_task_id,
+            "phase": phase,
+            "self_evolution_mode": getattr(args, "self_evolution_mode", "in_context"),
+            "backend": args.backend,
+            "context_mode": effective_context_mode,
+            "context_mode_override": context_mode_override,
+            "disable_context_compression": bool(disable_context_compression),
+            "framework_interaction_mode": args.framework_interaction_mode,
+            "codex_direct_image_input": bool(args.codex_direct_image_input),
+            "description_field": args.description_field,
+            "hide_decomposition": bool(args.hide_decomposition),
+            "protocol_surface": args.protocol_surface,
+            "choice_count": int(args.choice_count),
+            "choice_seed": int(args.choice_seed),
+            "choice_bank_jsonl": str(args.choice_bank_jsonl or ""),
+            "max_steps_factor": float(args.max_steps_factor or 0),
+            "l2_max_steps_factor": float(args.l2_max_steps_factor or 0),
+            "l3_max_steps_factor": float(args.l3_max_steps_factor or 0),
+            "l4_max_steps_factor": float(args.l4_max_steps_factor or 0),
+            "l5_max_steps_factor": float(args.l5_max_steps_factor or 0),
+            "l6_max_steps_factor": float(args.l6_max_steps_factor or 0),
+            "max_steps_extra": args.max_steps_extra,
+            "l1_max_steps_extra": args.l1_max_steps_extra,
+            "l2_max_steps_extra": args.l2_max_steps_extra,
+            "l3_max_steps_extra": args.l3_max_steps_extra,
+            "l4_max_steps_extra": args.l4_max_steps_extra,
+            "l5_max_steps_extra": args.l5_max_steps_extra,
+            "l6_max_steps_extra": args.l6_max_steps_extra,
+            "no_image_input": bool(args.no_image_input),
+            "write_human_trace_md": bool(args.write_human_trace_md),
+            "learning_task_ids": list(learning_task_ids) if learning_task_ids is not None else _learning_task_ids(args),
+            "related_learning_selection": related_learning_selection,
+            "resume_checkpoint": resume_checkpoint.as_dict() if resume_checkpoint else None,
+            "resume_without_prompt": bool(resume_without_prompt),
+            "export_checkpoint_dir": str(export_checkpoint_dir.resolve()) if export_checkpoint_dir else "",
+            "tools_enabled": bool(tools_enabled),
+            "component_l1_task_ids": _component_l1_ids(item),
+            "atomic_template_path": str(args.atomic_template_path or ""),
+            "subtask_template_path": str(args.subtask_template_path or ""),
+            "steps": [
+                {
+                    "index": step.index,
+                    "task_id": step.task_id,
+                    "level": step.level,
+                    "graph_path": str(step.graph_path),
+                    "unique_state_image_dir": str(step.unique_state_image_dir),
+                    "max_steps": step.max_steps,
+                    "server_name": step.server_name,
+                    "model_visible_session_label": f"session_{step.index:02d}" if args.hide_decomposition else step.task_id,
+                    "openclaw_mcp_tool_names": _openclaw_mcp_tool_names_for_step(step, multi_server=openclaw_multi_server)
+                    if args.backend == "openclaw"
+                    else {},
+                    "direct_mcp_tool_names": _direct_mcp_tool_names_for_step(
+                        step,
+                        backend=args.backend,
+                        multi_server=openclaw_multi_server,
+                    )
+                    if args.backend in {"openclaw", "claudecode"}
+                    else {},
+                    "output_dir": str(step.output_dir),
+                }
+                for step in steps
+            ],
+        },
+    )
+    protocol_manifest = build_protocol_manifest(
+        task_id=composite_task_id,
+        phase=phase,
+        self_evolution_mode=getattr(args, "self_evolution_mode", "in_context"),
+        protocol_surface=args.protocol_surface,
+        prompt=prompt,
+        post_task_prompt=post_task_prompt,
+        choice_count=int(args.choice_count),
+        choice_seed=int(args.choice_seed),
+        choice_bank_path=str(args.choice_bank_jsonl or ""),
+        steps=[
+            {
+                "index": step.index,
+                "task_id": step.task_id,
+                "level": step.level,
+                "max_steps": step.max_steps,
+            }
+            for step in steps
+        ],
+    )
+    _write_json(run_dir / "protocol_manifest.json", protocol_manifest)
+    (run_dir / "README_TONGSIM_COMPOSITE.md").write_text(prompt, encoding="utf-8")
+
+    if args.dry_run:
+        return {
+            "task_id": composite_task_id,
+            "phase": phase,
+            "dry_run": True,
+            "run_dir": str(run_dir.resolve()),
+            "steps": [
+                {
+                    "index": step.index,
+                    "task_id": step.task_id,
+                    "level": step.level,
+                    "max_steps": step.max_steps,
+                    "server_name": step.server_name,
+                    "model_visible_session_label": f"session_{step.index:02d}" if args.hide_decomposition else step.task_id,
+                }
+                for step in steps
+            ],
+        }
+
+    runtime_root = run_dir / "private_runtime"
+    runtime = TongSimFrameworkRuntime(runtime_root)
+    bridge_processes: list[subprocess.Popen[str]] = []
+    execution: AgentExecution | None = None
+    result_error: str | None = None
+    usage: dict[str, Any] | None = None
+    exported_checkpoint: AgentCheckpoint | None = None
+    backend: Any = None
+    diagnostics_api_key = ""
+    diagnostics_base_url = ""
+    close_proc_log_fn = None
+    remove_container_fn = None
+    # Put the unique run id before the long task id. Some framework Docker
+    # backends truncate container names; a suffix-only nonce can be chopped off
+    # and collide when different models run the same task/backend in parallel.
+    task_container_id = f"tongsim_seq_{uuid.uuid4().hex[:8]}_{_safe_slug(args.backend).lower()}_{_safe_slug(composite_task_id).lower()}"
+
+    try:
+        if args.backend == "hermesagent":
+            from tongbench_eval.agents.hermesagent import HermesAgentAgent
+
+            backend = HermesAgentAgent()
+            mcp_python_command = args.mcp_python_command or (
+                _resolve_native_mcp_python()
+                if is_native_runtime(args.runtime)
+                else "/opt/hermes/.venv/bin/python3"
+            )
+        elif args.backend == "codex":
+            from tongbench_eval.agents.codex import CodexAgent
+
+            backend = CodexAgent()
+            mcp_python_command = args.mcp_python_command or (
+                _resolve_native_mcp_python()
+                if is_native_runtime(args.runtime)
+                else "python3"
+            )
+        elif args.backend == "claudecode":
+            from tongbench_eval.agents.claudecode import ClaudeCodeAgent
+
+            backend = ClaudeCodeAgent()
+            mcp_python_command = args.mcp_python_command or (
+                _resolve_native_mcp_python()
+                if is_native_runtime(args.runtime)
+                else "python3"
+            )
+        elif args.backend == "openclaw":
+            from tongbench_eval.agents.openclaw import OpenClawAgent
+
+            gateway_port = int(args.gateway_port or os.environ.get("GATEWAY_PORT", "18789"))
+            backend = OpenClawAgent(gateway_port=gateway_port, image_model=args.openclaw_image_model)
+            mcp_python_command = args.mcp_python_command or (
+                _resolve_native_mcp_python()
+                if is_native_runtime(args.runtime)
+                else "python3"
+            )
+        else:
+            raise ValueError(f"Unsupported backend: {args.backend}")
+        from tongbench_eval.utils.docker_utils import close_proc_log as close_proc_log_fn
+        from tongbench_eval.utils.docker_utils import remove_container as remove_container_fn
+
+        steps, bridge_processes, bind_mounts = _create_sessions(
+            runtime=runtime,
+            runtime_root=runtime_root,
+            run_dir=run_dir,
+            steps=steps,
+            args=args,
+        )
+        public_workspace = run_dir / "agent_workspace"
+        if args.protocol_surface == "safe_choice":
+            _write_choice_sequence_config(
+                public_workspace / "exec",
+                steps,
+                native_task_id=task_container_id if is_native_runtime(args.runtime) else None,
+            )
+            mcp_servers = _choice_sequence_mcp_servers(
+                public_workspace / "exec",
+                python_command=mcp_python_command,
+                backend=args.backend,
+                direct_image_input=bool(args.codex_direct_image_input),
+                no_image_input=bool(args.no_image_input),
+                compress_images=bool(args.mcp_compress_images),
+                context_mode=effective_context_mode,
+                image_max_side=args.mcp_image_max_side,
+                image_max_base64_chars=args.mcp_image_max_base64_chars,
+                image_jpeg_quality=args.mcp_image_jpeg_quality,
+            )
+        else:
+            mcp_servers = _mcp_servers_for_steps(
+                steps,
+                python_command=mcp_python_command,
+                text_only=args.backend in {"codex", "openclaw"} and not bool(args.codex_direct_image_input),
+                image_content_only=args.backend == "openclaw" and bool(args.codex_direct_image_input),
+                anthropic_image_blocks=args.backend == "claudecode",
+                compress_images=bool(args.mcp_compress_images),
+                context_mode=effective_context_mode,
+                image_max_side=args.mcp_image_max_side,
+                image_max_base64_chars=args.mcp_image_max_base64_chars,
+                image_jpeg_quality=args.mcp_image_jpeg_quality,
+            )
+        if is_native_runtime(args.runtime):
+            mcp_servers = _nativeize_mcp_paths(mcp_servers, task_container_id)
+        runtime_options: dict[str, Any] = {"runtime": args.runtime}
+        hermes_options: dict[str, Any] = {}
+        request_overrides: dict[str, Any] = {}
+        if args.temperature is not None and not bool(args.no_model_temperature):
+            request_overrides["temperature"] = float(args.temperature)
+        if args.seed is not None and not bool(args.no_model_seed):
+            request_overrides["seed"] = int(args.seed)
+        if bool(args.responses_non_stream):
+            request_overrides["__responses_non_stream__"] = True
+        if args.backend == "hermesagent":
+            enabled_toolsets = (
+                ["mcp-household_task"]
+                if args.protocol_surface == "safe_choice"
+                else [f"mcp-{step.server_name}" for step in steps]
+            )
+            hermes_options = {
+                "mcp_servers": mcp_servers,
+                "enabled_toolsets": enabled_toolsets,
+                "max_iterations": int(args.max_iterations),
+                "context_mode": effective_context_mode,
+                "disable_context_compression": bool(disable_context_compression),
+            }
+            if request_overrides:
+                hermes_options["request_overrides"] = request_overrides
+            runtime_options["hermes"] = hermes_options
+        elif args.backend == "codex":
+            if args.protocol_surface == "legacy":
+                _write_codex_sequence_mcp_server(
+                    public_workspace / "exec",
+                    steps,
+                    hide_decomposition=bool(args.hide_decomposition),
+                    native_task_id=task_container_id if is_native_runtime(args.runtime) else None,
+                )
+                codex_servers = _codex_sequence_mcp_servers(
+                    mcp_python_command,
+                    direct_image_input=bool(args.codex_direct_image_input),
+                    args=args,
+                )
+            else:
+                codex_servers = _codex_mcp_servers(
+                    mcp_servers,
+                    tool_names=SAFE_CHOICE_MCP_TOOL_NAMES,
+                )
+            if is_native_runtime(args.runtime):
+                codex_servers = _nativeize_mcp_paths(codex_servers, task_container_id)
+            runtime_options["codex"] = {
+                "mcp_servers": codex_servers,
+                "disable_image_helper": bool(args.codex_direct_image_input),
+                "dashscope_responses_adapter": bool(args.codex_direct_image_input or args.codex_mcp_only_tools),
+                "mcp_only_tools": bool(args.codex_mcp_only_tools),
+            }
+        elif args.backend == "claudecode":
+            runtime_options["claudecode"] = {
+                "mcp_servers": mcp_servers,
+                "max_iterations": int(args.max_iterations),
+                "allowed_tools": (
+                    claudecode_allowed_tools(
+                        mcp_servers,
+                        tool_names=protocol_tool_names(args.protocol_surface),
+                    )
+                ),
+            }
+        elif args.backend == "openclaw":
+            runtime_options["openclaw"] = {
+                "mcp_servers": mcp_servers,
+                "decision_only": bool(args.decision_only),
+            }
+
+        spec = AgentTaskSpec(
+            task_id=task_container_id,
+            task={
+                "task_id": composite_task_id,
+                "category": "visual_household_task" if args.protocol_surface == "safe_choice" else "TongSIM",
+                "env": "",
+                "skills": "",
+                "warmup": "",
+                "skills_path": str((ROOT / "skills").resolve()),
+                "bind_mounts": bind_mounts,
+            },
+            workspace_path=str(public_workspace),
+            prompt=prompt,
+            timeout_seconds=int(args.timeout_sec),
+            output_dir=run_dir,
+            model=args.model,
+            thinking=args.thinking,

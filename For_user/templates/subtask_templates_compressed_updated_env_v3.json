@@ -1,0 +1,297 @@
+[
+  {
+    "subtask_id": "subtask_0002",
+    "subtask_type": "acquire_{object}",
+    "length": 3,
+    "primitive_sequence": [
+      {
+        "template_id": "look_at_{object}",
+        "action_type": "look",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "walk_to_{object}",
+        "action_type": "walk",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "pick_up_{object}",
+        "action_type": "pick",
+        "var_mapping": {
+          "object": "r1"
+        }
+      }
+    ],
+    "pre_state": [
+      "empty",
+      "exists(r1)"
+    ],
+    "post_state": [
+      "exists(r1)",
+      "holding(r1)",
+      "in_view(r1)",
+      "with_reach(r1)"
+    ]
+  },
+  {
+    "subtask_id": "subtask_0005",
+    "subtask_type": "close_container_{object}",
+    "length": 3,
+    "primitive_sequence": [
+      {
+        "template_id": "look_at_{object}",
+        "action_type": "look",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "walk_to_{object}",
+        "action_type": "walk",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "close_{object}",
+        "action_type": "close",
+        "var_mapping": {
+          "object": "r1"
+        }
+      }
+    ],
+    "pre_state": [
+      "exists(r1)",
+      "open(r1)"
+    ],
+    "post_state": [
+      "closed(r1)",
+      "exists(r1)",
+      "in_view(r1)",
+      "with_reach(r1)"
+    ]
+  },
+  {
+    "subtask_id": "subtask_0004",
+    "subtask_type": "open_container_{object}",
+    "length": 3,
+    "primitive_sequence": [
+      {
+        "template_id": "look_at_{object}",
+        "action_type": "look",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "walk_to_{object}",
+        "action_type": "walk",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "open_{object}",
+        "action_type": "open",
+        "var_mapping": {
+          "object": "r1"
+        }
+      }
+    ],
+    "pre_state": [
+      "closed(r1)",
+      "exists(r1)"
+    ],
+    "post_state": [
+      "exists(r1)",
+      "in_view(r1)",
+      "open(r1)",
+      "with_reach(r1)"
+    ]
+  },
+  {
+    "subtask_id": "subtask_0008",
+    "subtask_type": "plug_in_{object}",
+    "length": 3,
+    "primitive_sequence": [
+      {
+        "template_id": "look_at_{object}",
+        "action_type": "look",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "walk_to_{object}",
+        "action_type": "walk",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "plug_in_{object}",
+        "action_type": "plug_in",
+        "var_mapping": {
+          "object": "r1"
+        }
+      }
+    ],
+    "pre_state": [
+      "exists(r1)",
+      "unplugged(r1)"
+    ],
+    "post_state": [
+      "exists(r1)",
+      "in_view(r1)",
+      "plugged_in(r1)",
+      "with_reach(r1)"
+    ]
+  },
+  {
+    "subtask_id": "subtask_0007",
+    "subtask_type": "power_off_{object}",
+    "length": 3,
+    "primitive_sequence": [
+      {
+        "template_id": "look_at_{object}",
+        "action_type": "look",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "walk_to_{object}",
+        "action_type": "walk",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "switch_off_{object}",
+        "action_type": "switch_off",
+        "var_mapping": {
+          "object": "r1"
+        }
+      }
+    ],
+    "pre_state": [
+      "exists(r1)",
+      "powered_on(r1)"
+    ],
+    "post_state": [
+      "exists(r1)",
+      "in_view(r1)",
+      "powered_off(r1)",
+      "with_reach(r1)"
+    ]
+  },
+  {
+    "subtask_id": "subtask_0006",
+    "subtask_type": "power_on_{object}",
+    "length": 3,
+    "primitive_sequence": [
+      {
+        "template_id": "look_at_{object}",
+        "action_type": "look",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "walk_to_{object}",
+        "action_type": "walk",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "switch_on_{object}",
+        "action_type": "switch_on",
+        "var_mapping": {
+          "object": "r1"
+        }
+      }
+    ],
+    "pre_state": [
+      "exists(r1)",
+      "powered_off(r1)"
+    ],
+    "post_state": [
+      "exists(r1)",
+      "in_view(r1)",
+      "powered_on(r1)",
+      "with_reach(r1)"
+    ]
+  },
+  {
+    "subtask_id": "subtask_0001",
+    "subtask_type": "reach_{object}",
+    "length": 2,
+    "primitive_sequence": [
+      {
+        "template_id": "look_at_{object}",
+        "action_type": "look",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "walk_to_{object}",
+        "action_type": "walk",
+        "var_mapping": {
+          "object": "r1"
+        }
+      }
+    ],
+    "pre_state": [
+      "exists(r1)"
+    ],
+    "post_state": [
+      "exists(r1)",
+      "in_view(r1)",
+      "with_reach(r1)"
+    ]
+  },
+  {
+    "subtask_id": "subtask_0009",
+    "subtask_type": "unplug_{object}",
+    "length": 3,
+    "primitive_sequence": [
+      {
+        "template_id": "look_at_{object}",
+        "action_type": "look",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "walk_to_{object}",
+        "action_type": "walk",
+        "var_mapping": {
+          "object": "r1"
+        }
+      },
+      {
+        "template_id": "unplug_{object}",
+        "action_type": "unplug",
+        "var_mapping": {
+          "object": "r1"
+        }
+      }
+    ],
+    "pre_state": [
+      "exists(r1)",
+      "plugged_in(r1)"
+    ],
+    "post_state": [
+      "exists(r1)",
+      "in_view(r1)",
+      "unplugged(r1)",
+      "with_reach(r1)"
+    ]
+  }
+]

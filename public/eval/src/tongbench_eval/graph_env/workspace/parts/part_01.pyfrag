@@ -1,0 +1,650 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+try:
+    from tongbench_eval.graph_env.action_factorizer import (
+        build_global_action_types,
+        build_object_choices,
+        factorize_outgoing_edges,
+        parse_edge_action,
+    )
+    from tongbench_eval.graph_env.action_library import (
+        build_model_facing_action_candidates,
+        build_task_object_candidates,
+        load_atomic_templates,
+        load_subtask_templates,
+    )
+    from tongbench_eval.graph_env.action_effects import apply_template_effects
+    from tongbench_eval.graph_env.object_normalizer import infer_object_type_from_id, normalize_object_type
+    from tongbench_eval.graph_env.predicate_normalizer import normalize_predicate, normalize_predicate_set
+    from tongbench_eval.graph_env.state_consistency import apply_state_consistency_rules
+    from tongbench_eval.graph_env.action_preconditions import check_action_executable
+    from tongbench_eval.graph_env.action_preconditions import check_template_executable
+except ImportError:
+    import re
+
+    def _normalize_short_name(object_id: str) -> str:
+        lowered = object_id.lower()
+        if "cup" in lowered:
+            return "cup"
+        if "fruit" in lowered or "apple" in lowered:
+            return "fruit"
+        if "plate" in lowered:
+            return "plate"
+        if "remotecontroller" in lowered or "remote" in lowered:
+            return "remote_control"
+        if "coffeetable" in lowered or "table" in lowered:
+            return "coffee_table"
+        return "unknown"
+
+    def normalize_object_type(value: str) -> str:
+        raw = str(value or "").strip().lower().replace("-", "_")
+        raw = re.sub(r"^bp_", "", raw)
+        compact = re.sub(r"[^a-z]", "", raw)
+        if "banana" in compact:
+            return "banana"
+        if "tomato" in compact:
+            return "tomato"
+        if "eggplant" in compact:
+            return "eggplant"
+        if "doughnut" in compact:
+            return "doughnut"
+        if "bread" in compact:
+            return "bread"
+        if "fruit" in compact or "apple" in compact:
+            return "fruit"
+        if "coffeetable" in compact:
+            return "coffeetable"
+        if "aircondition" in compact:
+            return "aircondition"
+        if "remotecontroller" in compact or "remotecontrol" in compact:
+            return "remotecontrol"
+        if "bookshelves" in compact or "bookshelf" in compact:
+            return "bookshelf"
+        if "bookstack" in compact or "booksstack" in compact:
+            return "book"
+        if "ceilinglamp" in compact:
+            return "ceilinglamp"
+        if "window" in compact:
+            return "window"
+        if "cup" in compact:
+            return "cup"
+        if "plate" in compact:
+            return "plate"
+        if "bathshelf" in compact:
+            return "bathshelf"
+        if "tablelamp" in compact:
+            return "tablelamp"
+        if "trashcan" in compact:
+            return "trashcan"
+        return compact or "unknown"
+
+    def infer_object_type_from_id(object_id: str) -> str:
+        return normalize_object_type(object_id)
+
+    def normalize_predicate(predicate: str) -> str:
+        value = re.sub(r"\s+", " ", str(predicate).strip())
+        match = re.match(r"^([A-Za-z0-9_]+)\((.*)\)$", value)
+        if not match:
+            return value
+        name = match.group(1).strip()
+        args = [re.sub(r"\s+", " ", item.strip()) for item in match.group(2).split(",")]
+        args = [item for item in args if item]
+        return f"{name}({', '.join(args)})"
+
+    def normalize_predicate_set(predicates: Any) -> list[str]:
+        if predicates is None:
+            return []
+        if isinstance(predicates, dict):
+            if isinstance(predicates.get("predicates"), (list, tuple, set)):
+                predicates = list(predicates.get("predicates", []))
+            else:
+                predicates = []
+        elif not isinstance(predicates, (list, tuple, set)):
+            predicates = [predicates]
+        output: list[str] = []
+        seen: set[str] = set()
+        for predicate in predicates:
+            normalized = normalize_predicate(str(predicate))
+            if normalized not in seen:
+                seen.add(normalized)
+                output.append(normalized)
+        return output
+
+    def _normalize_object_id_token(value: Any) -> str:
+        return str(value).strip()
+
+    def _task_object_set(task_objects: list[str], current_predicates: list[str]) -> set[str]:
+        object_ids = {
+            _normalize_object_id_token(item)
+            for item in task_objects
+            if _normalize_object_id_token(item)
+        }
+        for predicate in normalize_predicate_set(current_predicates):
+            for object_id in _extract_ids_from_predicate(predicate):
+                normalized = _normalize_object_id_token(object_id)
+                if normalized:
+                    object_ids.add(normalized)
+        return object_ids
+
+    def apply_state_consistency_rules(
+        previous_state_predicates: list[str],
+        add_effects: list[str],
+        delete_effects: list[str],
+        selected_action_candidate: dict,
+        role_bindings: dict,
+    ) -> dict[str, Any]:
+        previous_state = set(normalize_predicate_set(previous_state_predicates))
+        final_add = set(normalize_predicate_set(add_effects))
+        final_delete = set(normalize_predicate_set(delete_effects))
+        consistency_adds: set[str] = set()
+        consistency_deletes: set[str] = set()
+        rules_applied: list[dict[str, Any]] = []
+        exclusive_in_view = bool(selected_action_candidate.get("_exclusive_in_view", True))
+
+        def _extract_args_local(predicate: str) -> list[str]:
+            if "(" not in predicate or ")" not in predicate:
+                return []
+            return [item.strip() for item in predicate.split("(", 1)[1].rsplit(")", 1)[0].split(",") if item.strip()]
+
+        def _record(rule: str, reason: str, deleted: set[str] | None = None, added: set[str] | None = None) -> None:
+            deleted = set() if deleted is None else {normalize_predicate(item) for item in deleted}
+            added = set() if added is None else {normalize_predicate(item) for item in added}
+            if not deleted and not added:
+                return
+            consistency_deletes.update(deleted)
+            consistency_adds.update(added)
+            final_delete.update(deleted)
+            final_add.update(added)
+            rules_applied.append(
+                {
+                    "rule": rule,
+                    "reason": reason,
+                    "deleted": normalize_predicate_set(sorted(deleted)),
+                    "added": normalize_predicate_set(sorted(added)),
+                }
+            )
+
+        holding_adds = [predicate for predicate in sorted(final_add) if predicate.startswith("holding(")]
+        if holding_adds:
+            kept = holding_adds[-1]
+            kept_args = _extract_args_local(kept)
+            kept_object = kept_args[0] if kept_args else None
+            deleted: set[str] = {"empty"} if "empty" in previous_state or "empty" in final_add else set()
+            for predicate in sorted(previous_state.union(final_add)):
+                if not predicate.startswith("holding("):
+                    continue
+                args = _extract_args_local(predicate)
+                if args and args[0] != kept_object:
+                    deleted.add(predicate)
+            _record("holding_vs_empty", "Holding a new object removes empty and any previous held object.", deleted=deleted)
+            if kept_object:
+                location_deletes = set()
+                for predicate in sorted(previous_state):
+                    if (predicate.startswith("on(") or predicate.startswith("in(")) and _extract_args_local(predicate)[:1] == [kept_object]:
+                        location_deletes.add(predicate)
+                _record("acquire_location_cleanup", "Holding an object removes prior on/in locations for that object.", deleted=location_deletes)
+
+        if "empty" in final_add:
+            deleted = {predicate for predicate in sorted(previous_state.union(final_add)) if predicate.startswith("holding(")}
+            _record("empty_clears_holding", "An empty hand state removes all holding predicates.", deleted=deleted)
+
+        for predicate in list(sorted(final_add)):
+            args = _extract_args_local(predicate)
+            if predicate.startswith("clean(") and args:
+                _record("clean_dirty_mutex", "A clean object cannot remain dirty.", deleted={f"dirty({args[0]})"})
+            if predicate.startswith("dirty(") and args:
+                _record("dirty_clean_mutex", "A dirty object cannot remain clean.", deleted={f"clean({args[0]})"})
+            if predicate.startswith("open(") and args:
+                _record("open_closed_mutex", "An open object cannot remain closed.", deleted={f"closed({args[0]})"})
+            if predicate.startswith("closed(") and args:
+                _record("closed_open_mutex", "A closed object cannot remain open.", deleted={f"open({args[0]})"})
+            if predicate.startswith("powered_on(") and args:
+                _record("power_on_off_mutex", "A powered-on object cannot remain powered off.", deleted={f"powered_off({args[0]})"})
+            if predicate.startswith("powered_off(") and args:
+                _record("power_off_on_mutex", "A powered-off object cannot remain powered on.", deleted={f"powered_on({args[0]})"})
+            if predicate.startswith("plugged_in(") and args:
+                _record("plugged_unplugged_mutex", "A plugged-in object cannot remain unplugged.", deleted={f"unplugged({args[0]})"})
+            if predicate.startswith("unplugged(") and args:
+                _record("unplugged_plugged_mutex", "An unplugged object cannot remain plugged in.", deleted={f"plugged_in({args[0]})"})
+
+        with_reach_adds = [predicate for predicate in sorted(final_add) if predicate.startswith("with_reach(")]
+        if with_reach_adds:
+            kept = with_reach_adds[-1]
+            kept_args = _extract_args_local(kept)
+            kept_target = kept_args[0] if kept_args else None
+            deleted = set()
+            for predicate in sorted(previous_state.union(final_add)):
+                if not predicate.startswith("with_reach("):
+                    continue
+                args = _extract_args_local(predicate)
+                if args and args[0] != kept_target:
+                    deleted.add(predicate)
+            _record("with_reach_exclusive", "with_reach tracks the currently active reachable target.", deleted=deleted)
+
+        if exclusive_in_view:
+            in_view_adds = [predicate for predicate in sorted(final_add) if predicate.startswith("in_view(")]
+            if in_view_adds:
+                kept = in_view_adds[-1]
+                kept_args = _extract_args_local(kept)
+                kept_target = kept_args[0] if kept_args else None
+                deleted = set()
+                for predicate in sorted(previous_state.union(final_add)):
+                    if not predicate.startswith("in_view("):
+                        continue
+                    args = _extract_args_local(predicate)
+                    if args and args[0] != kept_target:
+                        deleted.add(predicate)
+                _record("in_view_exclusive", "exclusive_in_view keeps only the newest in_view target.", deleted=deleted)
+
+        placement_targets_to_keep: set[str] = set()
+        for predicate in list(sorted(final_add)):
+            args = _extract_args_local(predicate)
+            if predicate.startswith("on(") and len(args) == 2:
+                obj, target = args
+                placement_targets_to_keep.add(f"with_reach({target})")
+                deleted = {f"holding({obj})", f"with_reach({obj})"}
+                for existing in sorted(previous_state):
+                    if (existing.startswith("on(") or existing.startswith("in(")) and _extract_args_local(existing)[:1] == [obj]:
+                        deleted.add(existing)
+                _record("place_on_location_consistency", "Placing an object on a target clears holding and previous locations for that object.", deleted=deleted, added={"empty", f"with_reach({target})"})
+            if predicate.startswith("in(") and len(args) == 2:
+                obj, target = args
+                placement_targets_to_keep.add(f"with_reach({target})")
+                deleted = {f"holding({obj})", f"with_reach({obj})"}
+                for existing in sorted(previous_state):
+                    if (existing.startswith("on(") or existing.startswith("in(")) and _extract_args_local(existing)[:1] == [obj]:
+                        deleted.add(existing)
+                _record("place_in_location_consistency", "Putting an object in a target clears holding and previous locations for that object.", deleted=deleted, added={"empty", f"with_reach({target})"})
+
+        if placement_targets_to_keep:
+            deleted = {
+                predicate
+                for predicate in sorted(previous_state.union(final_add))
+                if predicate.startswith("with_reach(") and predicate not in placement_targets_to_keep
+            }
+            _record("placement_reach_focus", "Placement keeps the target reachable and removes stale reach predicates.", deleted=deleted, added=placement_targets_to_keep)
+
+        final_delete -= {predicate for predicate in final_add if predicate != "holding(*)"}
+        return {
+            "final_add_effects": normalize_predicate_set(sorted(final_add)),
+            "final_delete_effects": normalize_predicate_set(sorted(final_delete)),
+            "consistency_deletes": normalize_predicate_set(sorted(consistency_deletes)),
+            "consistency_adds": normalize_predicate_set(sorted(consistency_adds)),
+            "consistency_rules_applied": rules_applied,
+        }
+
+    def parse_edge_action(action_id: str) -> dict[str, Any]:
+        action_id = str(action_id)
+        parsed = {
+            "raw_action_id": action_id,
+            "action_type": "unknown",
+            "object_id": None,
+            "target_id": None,
+            "required_args": [],
+            "display_name": action_id,
+        }
+        patterns = [
+            (r"^acquire_and_clean_\{object\}__(.+)$", "acquire_and_clean", "object_id", ["object_id"]),
+            (r"^acquire_\{object\}__(.+)$", "acquire", "object_id", ["object_id"]),
+            (r"^reach_\{object\}__(.+)$", "reach", "target_id", ["target_id"]),
+        ]
+        for pattern, action_type, key, required_args in patterns:
+            match = re.match(pattern, action_id)
+            if not match:
+                continue
+            parsed["action_type"] = action_type
+            parsed[key] = match.group(1)
+            parsed["required_args"] = required_args
+            parsed["display_name"] = f"{action_type} {match.group(1)}"
+            return parsed
+        match = re.match(r"^place_(.+?)_on_(.+)$", action_id)
+        if match:
+            parsed["action_type"] = "place"
+            parsed["object_id"] = match.group(1)
+            parsed["target_id"] = match.group(2)
+            parsed["required_args"] = ["object_id", "target_id"]
+            parsed["display_name"] = f"place {match.group(1)} on {match.group(2)}"
+        return parsed
+
+    def factorize_outgoing_edges(edges: list[dict[str, Any]]) -> dict[str, Any]:
+        descriptions = {
+            "acquire": "Acquire or pick up an object",
+            "reach": "Move/reach toward a target object or surface",
+            "place": "Place an object on a target",
+            "acquire_and_clean": "Acquire and clean an object",
+            "unknown": "Unparsed action type",
+        }
+        action_type_index: dict[str, dict[str, Any]] = {}
+        valid_bindings_internal: list[dict[str, Any]] = []
+        for edge in edges:
+            parsed = parse_edge_action(str(edge.get("action", "")))
+            action_type = parsed["action_type"]
+            if action_type not in action_type_index:
+                action_type_index[action_type] = {
+                    "action_type": action_type,
+                    "required_args": list(parsed["required_args"]),
+                    "description": descriptions.get(action_type, descriptions["unknown"]),
+                }
+            valid_bindings_internal.append(
+                {
+                    "action_type": action_type,
+                    "object_id": parsed["object_id"],
+                    "target_id": parsed["target_id"],
+                    "raw_action_id": parsed["raw_action_id"],
+                    "to_state": str(edge.get("to", "")),
+                }
+            )
+        return {
+            "action_types": list(action_type_index.values()),
+            "valid_bindings_internal": valid_bindings_internal,
+        }
+
+    def build_global_action_types(task: dict[str, Any]) -> list[dict[str, Any]]:
+        schema = {
+            "acquire": {"action_type": "acquire", "required_args": ["object_id"], "description": "Acquire or pick up an object."},
+            "acquire_and_clean": {"action_type": "acquire_and_clean", "required_args": ["object_id"], "description": "Acquire and clean an object."},
+            "reach": {"action_type": "reach", "required_args": ["target_id"], "description": "Move or reach toward a target object or surface."},
+            "place": {"action_type": "place", "required_args": ["object_id", "target_id"], "description": "Place an object on a target."},
+        }
+        ordered: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for edge in task.get("dag_edges", []):
+            action_type = parse_edge_action(str(edge.get("action", ""))).get("action_type")
+            if action_type in schema and action_type not in seen:
+                ordered.append(dict(schema[action_type]))
+                seen.add(action_type)
+        for action_type in ("acquire", "acquire_and_clean", "reach", "place"):
+            if action_type not in seen:
+                ordered.append(dict(schema[action_type]))
+        return ordered
+
+    def _extract_ids_from_predicate(predicate: str) -> list[str]:
+        match = re.search(r"\((.*)\)", predicate)
+        if not match:
+            return []
+        return [item.strip() for item in match.group(1).split(",") if item.strip()]
+
+    def build_object_choices(task: dict[str, Any], current_node_state: list[str]) -> list[dict[str, Any]]:
+        object_ids: set[str] = set()
+        task_scope = task.get("task_scope")
+        if isinstance(task_scope, list):
+            object_ids.update(str(item) for item in task_scope)
+        for predicate in current_node_state:
+            object_ids.update(_extract_ids_from_predicate(str(predicate)))
+        for edge in task.get("dag_edges", []):
+            parsed = parse_edge_action(str(edge.get("action", "")))
+            if parsed["object_id"]:
+                object_ids.add(str(parsed["object_id"]))
+            if parsed["target_id"]:
+                object_ids.add(str(parsed["target_id"]))
+        properties_by_object: dict[str, set[str]] = {object_id: set() for object_id in object_ids}
+        for predicate in current_node_state:
+            predicate = str(predicate)
+            if predicate.startswith("holding("):
+                for object_id in _extract_ids_from_predicate(predicate):
+                    properties_by_object.setdefault(object_id, set()).add("holding")
+            elif predicate.startswith("dirty("):
+                for object_id in _extract_ids_from_predicate(predicate):
+                    properties_by_object.setdefault(object_id, set()).add("dirty")
+            elif predicate.startswith("clean("):
+                for object_id in _extract_ids_from_predicate(predicate):
+                    properties_by_object.setdefault(object_id, set()).add("clean")
+            elif predicate.startswith("exists("):
+                for object_id in _extract_ids_from_predicate(predicate):
+                    props = properties_by_object.setdefault(object_id, set())
+                    props.add("exists")
+                    props.add("in_view")
+            elif predicate.startswith("on("):
+                args = _extract_ids_from_predicate(predicate)
+                if len(args) == 2:
+                    properties_by_object.setdefault(args[0], set()).add(f"on({args[1]})")
+            elif predicate.startswith("with_reach("):
+                for object_id in _extract_ids_from_predicate(predicate):
+                    properties_by_object.setdefault(object_id, set()).add("with_reach")
+        return [
+            {
+                "object_id": object_id,
+                "short_name": _normalize_short_name(object_id),
+                "current_properties": sorted(properties_by_object.get(object_id, set())),
+            }
+            for object_id in sorted(object_ids)
+        ]
+
+    def check_action_executable(
+        action_type: str,
+        object_id: str | None,
+        target_id: str | None,
+        current_predicates: list[str],
+        task_objects: list[str],
+    ) -> dict[str, Any]:
+        normalized_object = object_id
+        normalized_target = target_id
+        if action_type == "reach" and normalized_target is None and normalized_object is not None:
+            normalized_target = normalized_object
+            normalized_object = None
+        predicate_set = {str(predicate) for predicate in current_predicates}
+        task_object_set = {str(item) for item in task_objects}
+        required_args_map = {
+            "acquire": ["object_id"],
+            "acquire_and_clean": ["object_id"],
+            "reach": ["target_id"],
+            "place": ["object_id", "target_id"],
+        }
+        required_args = required_args_map.get(action_type, [])
+        violations: list[dict[str, str]] = []
+
+        if "object_id" in required_args and not normalized_object:
+            violations.append({"type": "missing_required_argument", "message": f"{action_type} requires object_id."})
+        if "target_id" in required_args and not normalized_target:
+            violations.append({"type": "missing_required_argument", "message": f"{action_type} requires target_id."})
+
+        def _has(prefix: str, object_name: str | None) -> bool:
+            return bool(object_name) and f"{prefix}({object_name})" in predicate_set
+
+        if not violations:
+            if action_type == "acquire":
+                if normalized_object not in task_object_set:
+                    violations.append({"type": "object_not_in_task_scope", "message": "The object is not in task scope."})
+                if not _has("exists", normalized_object):
+                    violations.append({"type": "object_does_not_exist", "message": "The object does not exist in the current state."})
+                if "empty" not in predicate_set:
+                    violations.append({"type": "hand_not_empty", "message": "The hand is not empty."})
+                if _has("holding", normalized_object):
+                    violations.append({"type": "object_already_held", "message": "The object is already being held."})
+            elif action_type == "acquire_and_clean":
+                if normalized_object not in task_object_set:
+                    violations.append({"type": "object_not_in_task_scope", "message": "The object is not in task scope."})
+                if not _has("exists", normalized_object):
+                    violations.append({"type": "object_does_not_exist", "message": "The object does not exist in the current state."})
+                if "empty" not in predicate_set:
+                    violations.append({"type": "hand_not_empty", "message": "The hand is not empty."})
+                if not _has("dirty", normalized_object):
+                    violations.append({"type": "object_not_dirty_or_not_cleanable", "message": "The object is not dirty or cleaning is not meaningful right now."})
+            elif action_type == "reach":
+                if normalized_target not in task_object_set:
+                    violations.append({"type": "target_not_in_task_scope", "message": "The target is not in task scope."})
+                if not _has("exists", normalized_target):
+                    violations.append({"type": "target_does_not_exist", "message": "The target does not exist in the current state."})
+                if _has("with_reach", normalized_target):
+                    violations.append({"type": "target_already_reached", "message": "The target is already within reach."})
+            elif action_type == "place":
+                if normalized_object not in task_object_set:
+                    violations.append({"type": "object_not_in_task_scope", "message": "The object is not in task scope."})
+                if normalized_target not in task_object_set:
+                    violations.append({"type": "target_not_in_task_scope", "message": "The target is not in task scope."})
+                if not _has("holding", normalized_object):
+                    violations.append({"type": "not_holding_object", "message": "The object is not currently being held."})
+                if not _has("exists", normalized_target):
+                    violations.append({"type": "target_does_not_exist", "message": "The target does not exist in the current state."})
+                if not (_has("with_reach", normalized_target) or _has("in_view", normalized_target)):
+                    violations.append({"type": "target_not_reached_or_visible", "message": "The target is neither reached nor visible in the current state."})
+            else:
+                violations.append({"type": "unknown_action_type", "message": "The action_type is not supported by the benchmark."})
+
+        return {
+            "executable_by_state": not violations,
+            "precondition_violations": violations,
+            "required_args": required_args,
+            "normalized_action": {
+                "action_type": action_type,
+                "object_id": normalized_object,
+                "target_id": normalized_target,
+            },
+        }
+
+    def _instantiate_value(value: str, role_bindings: dict[str, str]) -> str:
+        instantiated = str(value)
+        for role, object_id in role_bindings.items():
+            instantiated = instantiated.replace(f"{{{role}}}", str(object_id))
+            instantiated = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(role)}(?![A-Za-z0-9_])", str(object_id), instantiated)
+        return instantiated
+
+    def load_atomic_templates(path: Path) -> dict[str, Any]:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+
+    def load_subtask_templates(path: Path) -> list[dict[str, Any]]:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+
+    def build_task_object_candidates(task: dict[str, Any], current_state_predicates: list[str]) -> list[dict[str, Any]]:
+        object_choices = build_object_choices(task, current_state_predicates)
+        output: list[dict[str, Any]] = []
+        for item in object_choices:
+            object_id = str(item["object_id"])
+            short_name = str(item.get("short_name") or _normalize_short_name(object_id))
+            type_guess = infer_object_type_from_id(object_id)
+            output.append(
+                {
+                    "object_id": object_id,
+                    "short_name": short_name,
+                    "type_guess": type_guess,
+                    "current_properties": sorted(str(value) for value in item.get("current_properties", [])),
+                }
+            )
+        return output
+
+    def build_model_facing_action_candidates(
+        task: dict[str, Any],
+        current_state_predicates: list[str],
+        action_library_mode: str,
+        atomic_library: dict[str, Any] | None,
+        subtask_library: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        task_types = {infer_object_type_from_id(str(item["object_id"])) for item in build_object_choices(task, current_state_predicates)}
+        candidates: list[dict[str, Any]] = []
+        expose_all_atomic = action_library_mode == "atomic_only"
+        if action_library_mode in {"atomic_only", "atomic_plus_subtask"} and atomic_library is not None:
+            for template in atomic_library.get("templates", []):
+                required_roles = sorted(set(re.findall(r"\{([A-Za-z0-9_]+)\}", " ".join([str(template.get("template_id", ""))] + [str(x) for x in template.get("pre_state", [])] + [str(x) for x in template.get("post_state", [])]))))
+                raw_available_objects = template.get("available_objects", [])
+                if isinstance(raw_available_objects, dict):
+                    role_constraints = {
+                        role: [normalize_object_type(str(item)) for item in raw_available_objects.get(role, [])]
+                        for role in required_roles
+                    }
+                else:
+                    normalized_available = [normalize_object_type(str(item)) for item in raw_available_objects]
+                    role_constraints = {
+                        role: list(normalized_available)
+                        for role in required_roles
+                    }
+                if not expose_all_atomic and required_roles and not any(set(values).intersection(task_types) for values in role_constraints.values()):
+                    continue
+                candidates.append(
+                    {
+                        "action_level": "atomic",
+                        "template_id": str(template.get("template_id", "")),
+                        "action_type": str((template.get("action_space") or [template.get("template_id", "")])[0]),
+                        "description": str(template.get("task_description", "")),
+                        "required_roles": required_roles,
+                        "role_constraints": role_constraints,
+                        "pre_state": [str(value) for value in template.get("pre_state", [])],
+                        "post_state": [str(value) for value in template.get("post_state", [])],
+                        "net_add": [str(value) for value in template.get("post_state", [])],
+                        "net_delete": [],
+                        "primitive_sequence": [],
+                        "candidate_source": "atomic_templates",
+                    }
+                )
+        elif action_library_mode == "subtask_only" and atomic_library is not None:
+            for template in atomic_library.get("templates", []):
+                if str(template.get("template_id", "")) not in {"place_{object1}_on_{object2}", "place_{object1}_in_{object2}"}:
+                    continue
+                required_roles = sorted(set(re.findall(r"\{([A-Za-z0-9_]+)\}", " ".join([str(template.get("template_id", ""))] + [str(x) for x in template.get("pre_state", [])] + [str(x) for x in template.get("post_state", [])]))))
+                raw_available_objects = template.get("available_objects", [])
+                if isinstance(raw_available_objects, dict):
+                    role_constraints = {
+                        role: [normalize_object_type(str(item)) for item in raw_available_objects.get(role, [])]
+                        for role in required_roles
+                    }
+                else:
+                    normalized_available = [normalize_object_type(str(item)) for item in raw_available_objects]
+                    role_constraints = {
+                        role: list(normalized_available)
+                        for role in required_roles
+                    }
+                if required_roles and not any(set(values).intersection(task_types) for values in role_constraints.values()):
+                    continue
+                candidates.append(
+                    {
+                        "action_level": "atomic",
+                        "template_id": str(template.get("template_id", "")),
+                        "action_type": str((template.get("action_space") or [template.get("template_id", "")])[0]),
+                        "description": str(template.get("task_description", "")),
+                        "required_roles": required_roles,
+                        "role_constraints": role_constraints,
+                        "pre_state": [str(value) for value in template.get("pre_state", [])],
+                        "post_state": [str(value) for value in template.get("post_state", [])],
+                        "net_add": [str(value) for value in template.get("post_state", [])],
+                        "net_delete": [],
+                        "primitive_sequence": [],
+                        "candidate_source": "subtask_only_required_atomic_placement",
+                    }
+                )
+        if action_library_mode != "atomic_only" and subtask_library is not None:
+            for template in subtask_library:
+                role_constraints = {
+                    str(role): [normalize_object_type(str(item)) for item in values]
+                    for role, values in template.get("roles", {}).items()
+                    if isinstance(values, list)
+                }
+                if role_constraints and not any(set(values).intersection(task_types) for values in role_constraints.values()):
+                    continue
+                candidates.append(
+                    {
+                        "action_level": "subtask",
+                        "template_id": str(template.get("subtask_id", "")),
+                        "action_type": str(template.get("subtask_type", "")),
+                        "description": f"{template.get('subtask_type', 'subtask')} via {' -> '.join(str(step.get('template_id', '')) for step in template.get('primitive_sequence', []) if isinstance(step, dict))}",
+                        "required_roles": [str(role) for role in template.get("roles", {}).keys()],
+                        "role_constraints": role_constraints,
+                        "pre_state": [str(value) for value in template.get("pre_state", [])],
+                        "post_state": [str(value) for value in template.get("post_state", [])],
+                        "net_add": [str(value) for value in template.get("net_add", [])],
+                        "net_delete": [str(value) for value in template.get("net_delete", [])],
+                        "primitive_sequence": [dict(step) for step in template.get("primitive_sequence", []) if isinstance(step, dict)],
+                        "candidate_source": "subtask_templates",
+                    }
+                )
+        return candidates
+
+    def check_template_executable(
+        selected_action_candidate: dict[str, Any],
+        role_bindings: dict[str, str],
+        current_state_predicates: list[str],
+        task_objects: list[str],
+    ) -> dict[str, Any]:
+        current_state = set(normalize_predicate_set(current_state_predicates))
+        task_object_set = _task_object_set(task_objects, list(current_state))
+        violations: list[dict[str, str]] = []
+        instantiated_pre_state: list[str] = []
+        satisfied_preconditions: list[str] = []
+        missing_preconditions: list[str] = []
+        required_roles = [str(item) for item in selected_action_candidate.get("required_roles", [])]

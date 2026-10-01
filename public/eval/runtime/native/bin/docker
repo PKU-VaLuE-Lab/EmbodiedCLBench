@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""Small Docker CLI compatibility layer for TongBench native mode.
+
+It implements only the operations used by the repository's runners.  It is
+not a general container runtime and deliberately ignores image isolation,
+GPU flags, and read-only mount enforcement.  Each ``run`` creates an isolated
+per-task directory; ``exec`` runs the requested command as the current user.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+_root_value = os.environ.get("TONGBENCH_NATIVE_ROOT", "").strip()
+ROOT = (
+    Path(_root_value).expanduser()
+    if _root_value
+    else Path.home() / ".cache" / "tongbench" / "native-runtime"
+)
+TASKS = ROOT / "tasks"
+NATIVE_BUNDLE_ENV = "TONGBENCH_NATIVE_BUNDLE_ROOT"
+
+
+def die(message: str, code: int = 1) -> "NoReturn":
+    print(f"native runtime: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def safe_name(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "_.-" else "_" for ch in value)
+
+
+def task_dir(task_id: str) -> Path:
+    return TASKS / safe_name(task_id)
+
+
+def bundle_root() -> Path | None:
+    value = os.environ.get(NATIVE_BUNDLE_ENV, "").strip()
+    if not value:
+        return None
+    return Path(value).expanduser().resolve()
+
+
+def metadata_path(task_id: str) -> Path:
+    return task_dir(task_id) / "runtime_metadata.json"
+
+
+def read_metadata(task_id: str) -> dict:
+    path = metadata_path(task_id)
+    if not path.is_file():
+        die(f"unknown task {task_id!r}")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        die(f"invalid metadata for {task_id}: {exc}")
+
+
+def write_metadata(task_id: str, payload: dict) -> None:
+    path = metadata_path(task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def parse_env_args(values: list[str]) -> dict[str, str]:
+    env: dict[str, str] = {}
+    index = 0
+    while index < len(values):
+        token = values[index]
+        if token == "-e" and index + 1 < len(values):
+            item = values[index + 1]
+            key, separator, value = item.partition("=")
+            env[key] = value if separator else os.environ.get(key, "")
+            index += 2
+            continue
+        index += 1
+    return env
+
+
+def parse_mounts(values: list[str]) -> dict[str, str]:
+    mounts: dict[str, str] = {}
+    index = 0
+    while index < len(values):
+        if values[index] == "-v" and index + 1 < len(values):
+            spec = values[index + 1]
+            parts = spec.split(":")
+            if len(parts) >= 2:
+                host, container = parts[0], parts[1]
+                mounts[container.rstrip("/") or "/"] = str(Path(host).expanduser().resolve())
+            index += 2
+            continue
+        index += 1
+    return mounts
+
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def link_tree_with_overrides(
+    source: Path,
+    destination: Path,
+    *,
+    copied_paths: set[str] | None = None,
+) -> None:
+    """Expose a shared bundle through a task-local writable overlay.
+
+    Most files are symlinks into the shared bundle.  A small set of files that
+    the existing runners patch at startup is copied into the task directory,
+    preserving Docker's per-container write behavior without copying the full
+    runtime for every task.
+    """
+
+    if not source.is_dir():
+        die(f"native harness bundle directory does not exist: {source}")
+    destination.mkdir(parents=True, exist_ok=True)
+    copied_paths = copied_paths or set()
+    for child in source.iterdir():
+        relative = child.relative_to(source).as_posix()
+        target = destination / child.name
+        if relative in copied_paths:
+            if child.is_dir() and not child.is_symlink():
+                shutil.copytree(child, target, symlinks=True, dirs_exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(child, target, follow_symlinks=True)
+            continue
+        if child.is_dir() and not child.is_symlink():
+            target.mkdir(parents=True, exist_ok=True)
+            link_tree_with_overrides(
+                child,
+                target,
+                copied_paths={
+                    path[len(relative) + 1 :]
+                    for path in copied_paths
+                    if path.startswith(relative + "/")
+                },
+            )
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                target.symlink_to(child)
+            except FileExistsError:
+                remove_path(target)
+                target.symlink_to(child)
+
+
+def prepare_harness_overlays(root: Path) -> None:
+    bundle = bundle_root()
+    if bundle is None:
+        return
+
+    hermes_source = bundle / "hermes"
+    hermes_destination = root / "opt" / "hermes"
+    link_tree_with_overrides(
+        hermes_source,
+        hermes_destination,
+        copied_paths={"run_agent.py", "tools/mcp_tool.py"},
+    )
+
+    claude_source = bundle / "claudecode" / "app"
+    claude_destination = root / "claude_code"
+    link_tree_with_overrides(
+        claude_source,
+        claude_destination,
+        copied_paths={
+            "src/QueryEngine.ts",
+            "src/tasks/LocalAgentTask/LocalAgentTask.tsx",
+        },
+    )
+
+    bun_home = bundle / "claudecode" / "bun_home"
+    if bun_home.is_dir():
+        bun_destination = root / "root" / ".bun"
+        if bun_destination.exists() or bun_destination.is_symlink():
+            remove_path(bun_destination)
+        bun_destination.parent.mkdir(parents=True, exist_ok=True)
+        bun_destination.symlink_to(bun_home)
+
+
+def make_task(task_id: str, env: dict[str, str], mounts: dict[str, str]) -> None:
+    root = task_dir(task_id)
+    if root.exists():
+        die(f"task directory already exists: {task_id}")
+    for relative in (
+        "root/.openclaw/agents/main/sessions",
+        "root/.codex/sessions",
+        "root/.claude/projects",
+        "tmp",
+        "tmp_workspace",
+        "opt/hermes/tools",
+        "openclaw",
+        "home",
+        "app",
+    ):
+        (root / relative).mkdir(parents=True, exist_ok=True)
+    prepare_harness_overlays(root)
+    payload = {
+        "task_id": task_id,
+        "created_at": time.time(),
+        "env": env,
+        "mounts": mounts,
+        "pids": [],
+    }
+    write_metadata(task_id, payload)
+
+
+def path_map(meta: dict) -> dict[str, str]:
+    root = task_dir(str(meta["task_id"]))
+    mapping = {
+        "/tmp_workspace": str(root / "tmp_workspace"),
+        "/opt/hermes": str(root / "opt" / "hermes"),
+        "/claude_code": str(root / "claude_code"),
+        "/root": str(root / "root"),
+        "/tmp": str(root / "tmp"),
+        "/home": str(root / "home"),
+        "/app": str(root / "app"),
+    }
+    mapping.update({str(key).rstrip("/") or "/": str(value) for key, value in meta.get("mounts", {}).items()})
+    return dict(sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True))
+
+
+def translate(value: str, mapping: dict[str, str]) -> str:
+    result = str(value)
+    # Native config files contain absolute host paths under the task root.
+    # Protect that prefix before translating container paths such as /home or
+    # /tmp; otherwise a host path can be rewritten a second time.
+    protected_native_roots = [str(ROOT)]
+    bundle = bundle_root()
+    if bundle is not None:
+        # MCP configuration may contain the host path to the shared bundled
+        # Python.  Keep it intact when a shell command is translated.
+        protected_native_roots.append(str(bundle))
+    protected_native_paths: dict[str, str] = {}
+
+    # Shell commands are passed as one argument to ``bash -c``.  In that
+    # form, the host interpreter path is embedded inside the string rather
+    # than appearing as argv[0].  Preserve existing absolute host files before
+    # applying container-prefix translation, otherwise /home/vll/.../python
+    # is rewritten into the per-task sandbox.
+    def protect_existing_host_path(match: re.Match[str]) -> str:
+        candidate = match.group(1)
+        try:
+            is_host_file = Path(candidate).is_file()
+        except OSError:
+            # Some container-like paths (for example /root/.codex) are not
+            # readable by the host user. They are not host paths to preserve.
+            is_host_file = False
+        if not is_host_file:
+            return match.group(0)
+        marker = f"\x00TONGBENCH_EXISTING_HOST_PATH_{len(protected_native_paths)}\x00"
+        protected_native_paths[marker] = candidate
+        return match.group(0).replace(candidate, marker, 1)
+
+    result = re.sub(
+        r"(?<![A-Za-z0-9_.-])(/[A-Za-z0-9_./-]+)(?=$|[\s;|&:])",
+        protect_existing_host_path,
+        result,
+    )
+    if protected_native_roots:
+        def protect_native_path(match: re.Match[str]) -> str:
+            marker = f"\x00TONGBENCH_NATIVE_PATH_{len(protected_native_paths)}\x00"
+            protected_native_paths[marker] = match.group(0)
+            return marker
+
+        for protected_native_root in sorted(set(protected_native_roots), key=len, reverse=True):
+            result = re.sub(
+                rf"{re.escape(protected_native_root)}(?:/[A-Za-z0-9_.-]+)*",
+                protect_native_path,
+                result,
+            )
+    # Replace all container prefixes in one pass.  Doing this as a loop is
+    # subtly wrong: after /tmp_workspace is replaced, a later /tmp pass can
+    # rewrite the /tmp suffix inside the newly inserted host path.
+    placeholders: dict[str, str] = {}
+    sources = [source for source in mapping if source != "/"]
+    sources.sort(key=len, reverse=True)
+    if sources:
+        pattern = "|".join(re.escape(source) for source in sources)
+
+        def protect_container_path(match: re.Match[str]) -> str:
+            source = match.group(0)
+            marker = f"\x00TONGBENCH_PATH_{len(placeholders)}\x00"
+            placeholders[marker] = mapping[source]
+            return marker
+
+        result = re.sub(
+            rf"(?<![A-Za-z0-9_.-])(?:{pattern})(?=$|[^A-Za-z0-9_.-])",
+            protect_container_path,
+            result,
+        )
+    for marker, target in placeholders.items():
+        result = result.replace(marker, target)
+    for marker, native_path in protected_native_paths.items():
+        result = result.replace(marker, native_path)
+    return result
+
+
+def translate_command(args: list[str], mapping: dict[str, str]) -> list[str]:
+    translated = [translate(token, mapping) for token in args]
+    # ``exec`` runs processes on the host in native mode.  The first token is
+    # therefore an executable, not a path inside the emulated container.  In
+    # particular, preserve the evaluation venv Python under /home or /opt;
+    # translating it into the task sandbox makes MCP startup fail.
+    if args and os.path.isabs(args[0]) and Path(args[0]).is_file() and os.access(args[0], os.X_OK):
+        translated[0] = args[0]
+    # The Hermes image uses a fixed interpreter path.  Native mode uses the
+    # configured evaluation Python when that path is not part of a bundle.
+    fallback_python = os.environ.get("TONGBENCH_NATIVE_MCP_PYTHON", "").strip()
+    if fallback_python and translated:
+        original = args[0]
+        if original.endswith("/.venv/bin/python3") and not Path(translated[0]).exists():
+            translated[0] = fallback_python
+    return translated
+
+
+def build_exec_env(meta: dict, mapping: dict[str, str], extra_env: dict[str, str]) -> dict[str, str]:
+    env = dict(os.environ)
+    env.update({key: translate(value, mapping) for key, value in meta.get("env", {}).items()})
+    env.update({key: translate(value, mapping) for key, value in extra_env.items()})
+    root = task_dir(str(meta["task_id"]))
+    env["HOME"] = str(root / "root")
+    env["TMPDIR"] = str(root / "tmp")
+    env["TONGBENCH_NATIVE_TASK_ROOT"] = str(root)
+    env["TONGBENCH_NATIVE_RUNTIME"] = "1"
+    return env
+
+
+def record_pid(meta: dict, pid: int) -> None:
+    pids = list(meta.get("pids", []))
+    pids.append(int(pid))
+    meta["pids"] = pids[-128:]
+    write_metadata(str(meta["task_id"]), meta)
+
+
+def execute(task_id: str, command: list[str], extra_env: dict[str, str]) -> int:
+    meta = read_metadata(task_id)
+    mapping = path_map(meta)
+    translated = translate_command(command, mapping)
+    if not translated:
+        die("docker exec received no command")
+    env = build_exec_env(meta, mapping, extra_env)
+    root = task_dir(task_id)
+    cwd = root / "tmp_workspace"
+    cwd.mkdir(parents=True, exist_ok=True)
+    try:
+        process = subprocess.Popen(
+            translated,
+            cwd=str(cwd),
+            env=env,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        die(f"command not found: {translated[0]} ({exc})")
+    record_pid(meta, process.pid)
+    return process.wait()
+
+
+def copy_contents(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for child in source.iterdir():
+        target = destination / child.name
+        if child.is_dir() and not child.is_symlink():
+            shutil.copytree(child, target, dirs_exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(child, target, follow_symlinks=False)
+
+
+def resolve_spec(spec: str, task_id: str, meta: dict) -> tuple[Path, bool]:
+    prefix = f"{task_id}:"
+    is_task = spec.startswith(prefix)
+    raw = spec[len(prefix):] if is_task else spec
+    contents_only = raw.endswith("/.")
+    if contents_only:
+        raw = raw[:-2].rstrip("/") or "/"
+    path = Path(translate(raw, path_map(meta))) if is_task else Path(raw).expanduser()
+    return path, contents_only
+
+
+def copy_item(source_spec: str, destination_spec: str) -> None:
+    source_task_id = source_spec.split(":", 1)[0] if ":" in source_spec else ""
+    destination_task_id = destination_spec.split(":", 1)[0] if ":" in destination_spec else ""
+    task_id = source_task_id or destination_task_id
+    if not task_id:
+        die("native cp requires one task-qualified path")
+    meta = read_metadata(task_id)
+    source, source_contents = resolve_spec(source_spec, task_id, meta)
+    destination, _ = resolve_spec(destination_spec, task_id, meta)
+    if not source.exists():
+        die(f"copy source does not exist: {source_spec}")
+    if source_contents:
+        copy_contents(source, destination)
+        return
+    if source.is_dir():
+        if destination.exists() and destination.is_dir():
+            destination = destination / source.name
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+    else:
+        if destination.exists() and destination.is_dir():
+            destination = destination / source.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination, follow_symlinks=False)
+
+
+def remove_task(task_id: str) -> int:
+    root = task_dir(task_id)
+    if not root.exists():
+        return 0
+    try:
+        meta = read_metadata(task_id)
+    except SystemExit:
+        meta = {"pids": []}
+    for pid in meta.get("pids", []):
+        try:
+            os.killpg(int(pid), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+    shutil.rmtree(root, ignore_errors=True)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        die("missing command")
+    command = argv[0]
+    if command == "run":
+        if "--name" not in argv:
+            die("native run requires --name")
+        task_id = argv[argv.index("--name") + 1]
+        make_task(task_id, parse_env_args(argv), parse_mounts(argv))
+        print(task_id)
+        return 0
+    if command == "exec":
+        args = list(argv[1:])
+        extra_env: dict[str, str] = {}
+        index = 0
+        while index < len(args) and args[index].startswith("-"):
+            token = args[index]
+            if token in {"-u", "--user", "-e", "--env", "--workdir", "-w"}:
+                if index + 1 >= len(args):
+                    die(f"missing value for {token}")
+                if token in {"-e", "--env"}:
+                    key, separator, value = args[index + 1].partition("=")
+                    extra_env[key] = value if separator else os.environ.get(key, "")
+                index += 2
+            else:
+                index += 1
+        if index >= len(args):
+            die("native exec requires a task id")
+        task_id = args[index]
+        return execute(task_id, args[index + 1 :], extra_env)
+    if command == "cp":
+        if len(argv) != 3:
+            die("native cp expects SOURCE and DESTINATION")
+        copy_item(argv[1], argv[2])
+        return 0
+    if command == "inspect":
+        task_id = argv[-1]
+        if not metadata_path(task_id).is_file():
+            return 1
+        print(json.dumps([{"Id": task_id, "State": {"Running": True}}]))
+        return 0
+    if command == "rm":
+        task_ids = [item for item in argv[1:] if not item.startswith("-")]
+        for task_id in task_ids:
+            remove_task(task_id)
+        return 0
+    if command == "logs":
+        return 0
+    die(f"unsupported command {command!r}; supported: run, exec, cp, inspect, rm")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

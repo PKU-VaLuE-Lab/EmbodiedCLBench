@@ -1,0 +1,799 @@
+def _rewrite_session_config(step_workspace: Path, bridge_mount: str) -> None:
+    for target_dir in (step_workspace, step_workspace / "exec"):
+        config_path = target_dir / ".tongsim_session.json"
+        payload = _read_json(config_path)
+        payload["bridge_mount"] = bridge_mount
+        _write_json(config_path, payload)
+
+
+TONGSIM_MCP_TOOL_NAMES = LEGACY_MCP_TOOL_NAMES
+
+
+def _openclaw_mcp_tool_name(server_name: str, tool_name: str, *, multi_server: bool) -> str:
+    if not multi_server:
+        return tool_name
+    safe_server = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in str(server_name))
+    return f"mcp__{safe_server}__{tool_name}"
+
+
+def _openclaw_mcp_tool_names_for_step(step: DialogueStep, *, multi_server: bool) -> dict[str, str]:
+    return {
+        tool_name: _openclaw_mcp_tool_name(step.server_name, tool_name, multi_server=multi_server)
+        for tool_name in TONGSIM_MCP_TOOL_NAMES
+    }
+
+
+def _claudecode_mcp_tool_names_for_step(step: DialogueStep) -> dict[str, str]:
+    safe_server = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in str(step.server_name))
+    return {
+        tool_name: f"mcp__{safe_server}__{tool_name}"
+        for tool_name in TONGSIM_MCP_TOOL_NAMES
+    }
+
+
+def _codex_mcp_tool_names_for_step(step: DialogueStep) -> dict[str, str]:
+    _ = step
+    return {
+        tool_name: f"tongsim_sequence/{tool_name}"
+        for tool_name in TONGSIM_MCP_TOOL_NAMES
+    }
+
+
+def _direct_mcp_tool_names_for_step(
+    step: DialogueStep,
+    *,
+    backend: str,
+    multi_server: bool,
+) -> dict[str, str]:
+    if backend == "codex":
+        return _codex_mcp_tool_names_for_step(step)
+    if backend == "claudecode":
+        return _claudecode_mcp_tool_names_for_step(step)
+    return _openclaw_mcp_tool_names_for_step(step, multi_server=multi_server)
+
+
+def _build_sequence_prompt(
+    steps: list[DialogueStep],
+    *,
+    backend: str = "hermesagent",
+    codex_direct_image_input: bool = False,
+    description_field: str = "description",
+    hide_decomposition: bool = False,
+    protocol_surface: str = "legacy",
+    safe_choice_final_instruction: str | None = None,
+    skill_text: str | None = None,
+) -> str:
+    if protocol_surface == "safe_choice":
+        lines = [
+            "You will solve visual household tasks one at a time.",
+            "For the current task, inspect the image and choose the best next option.",
+            "Use only the current task goal, current image, previous feedback, and the listed choices.",
+        ]
+        if skill_text is not None:
+            lines.extend(
+                [
+                    "",
+                    "Use the following skill summary as learned guidance to help you solve the new task. It contains reusable knowledge from previous interaction experience. The current task goal, current image, previous feedback, and listed choices remain the source of truth.",
+                    "",
+                    "<skill>",
+                    skill_text.strip(),
+                    "</skill>",
+                    "",
+                    "The skill summary is reference guidance, not a task episode or a completion result.",
+                    "The current task is new and has just started, so it is not complete yet. First call observe, then choose exactly one action option per turn and wait for its result. Continue until the current task's environment result reports task_complete=true. Do not give a final answer before then.",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "Start by calling observe. For each decision, call select_option with exactly one listed letter.",
+                "Call at most one TongSIM communication tool in each assistant response. After calling observe, select_option, or status, stop immediately and wait for the returned tool result before calling another TongSIM tool.",
+                "Do not call select_option more than once in one assistant response. Do not retry the same tool call or try alternate tool names before receiving feedback.",
+                "When a tool result contains task_complete=true, follow its all_tasks_complete value: call observe for the next task when it is false, and stop using task tools when it is true.",
+                safe_choice_final_instruction
+                or "Only when all_tasks_complete=true should you give one short final answer summarizing completion.",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+    use_direct_mcp_tools = backend in {"openclaw", "codex", "claudecode"}
+    multi_server = len(steps) > 1
+    lines = [
+        "# TongSIM Composite Dialogue Task",
+        "",
+        "You are in one conversation that contains multiple independent hidden TongSIM sessions.",
+        (
+            "Complete the sessions strictly in the listed order. The tongsim_sequence tools automatically finalize and advance when the current task is done."
+            if backend == "codex"
+            else "Complete the sessions strictly in the listed order. The runtime advances automatically after each task is done."
+        ),
+        "",
+    ]
+    lines.append("Session order:" if hide_decomposition else "Task order:")
+    for step in steps:
+        task = load_tongsim_task(step.graph_path, description_field=description_field)
+        session_label = f"Session {step.index}"
+        if use_direct_mcp_tools:
+            tool_names = _direct_mcp_tool_names_for_step(step, backend=backend, multi_server=multi_server)
+            tool_list = ", ".join(tool_names[name] for name in TONGSIM_MCP_TOOL_NAMES)
+            if hide_decomposition:
+                lines.append(
+                    f"{step.index}. {session_label} (max {step.max_steps} environment actions, MCP tools: {tool_list}). The task instruction is returned by observe_current_state for this session."
+                )
+            else:
+                lines.append(
+                    f"{step.index}. {step.task_id} ({step.level}, max {step.max_steps} environment actions, MCP tools: {tool_list}): {task.description}"
+                )
+        else:
+            if hide_decomposition:
+                lines.append(
+                    f"{step.index}. {session_label} (max {step.max_steps} environment actions, toolset mcp-{step.server_name}). The task instruction is returned by observe_current_state for this session."
+                )
+            else:
+                lines.append(
+                    f"{step.index}. {step.task_id} ({step.level}, max {step.max_steps} environment actions, toolset mcp-{step.server_name}): {task.description}"
+                )
+
+    if use_direct_mcp_tools:
+        framework_name = {
+            "openclaw": "OpenClaw",
+            "codex": "Codex",
+            "claudecode": "Claude Code",
+        }.get(backend, "the current agent")
+        if backend == "codex" and codex_direct_image_input:
+            tool_access_rule = (
+                "- Do not use web_search, shell commands, or file inspection to solve TongSIM. "
+                "The listed MCP tools are already available as Codex tools, and observation images are attached directly in tool results."
+            )
+        elif backend == "codex":
+            tool_access_rule = (
+                "- Do not use web_search, shell commands, or file inspection to solve TongSIM, "
+                "except the provided .wildclaw_image.py image helper when visual inspection is needed. "
+                "The listed MCP tools are already available as Codex tools."
+            )
+        else:
+            tool_access_rule = (
+                "- Do not use web_search, shell commands, or file inspection to solve TongSIM. "
+                f"The listed MCP tools are already available as {framework_name} tools."
+            )
+        lines.extend(
+            [
+                "",
+                "For each task:",
+                "- Use only that task's listed MCP tools while solving that task.",
+                "- Use only tongsim_sequence/* tools; they route to the current task and advance automatically after completion."
+                if backend == "codex"
+                else "- Use the MCP server namespace shown for the current task; do not call another task's tool namespace.",
+                tool_access_rule,
+                "- Do not call list_mcp_resources or list_mcp_resource_templates; the exact MCP tool names are listed above.",
+                "- Do not try to call MCP tools from the terminal. Call the listed MCP tool names directly.",
+                "- Call at most one TongSIM MCP tool in each assistant response. After any TongSIM tool call, stop immediately and wait for its tool result before calling another TongSIM tool.",
+                "- Do not batch observe_current_state, choose_action, or check_task_status in the same assistant response.",
+                "- Start by calling that task's observe_current_state MCP tool.",
+                "- Do not call list_prompts/get_prompt or try to retrieve a separate task prompt; observe_current_state is the only way to receive the current task instruction.",
+                "- Submit environment actions only with that task's choose_action MCP tool.",
+                "- Check completion only with that task's check_task_status MCP tool."
+                if backend == "codex"
+                else "- Check completion only with that task's check_task_status MCP tool.",
+                "- Use the returned task state, object candidates, action candidates, feedback, and observation image as the source of truth."
+                if backend in {"codex", "claudecode"}
+                else "- Use the returned task state, object candidates, action candidates, and feedback as the source of truth.",
+                "- Choose exactly one exposed action template for each step.",
+                "- Keep template_id exactly equal to the exposed candidate name, such as look_at_{object} or place_{object1}_on_{object2}.",
+                "- Never substitute object ids into template_id.",
+                "- Bind each placeholder to exactly one provided object_id.",
+                "- Do not invent object aliases when object_id values are provided.",
+                "- If the previous action made no progress, choose a different action or target.",
+                "- When all tasks have been finalized, stop using TongSIM tools."
+                if backend == "codex"
+                else "- When the environment reports done=true, the runtime advances automatically; call observe to continue the next task or stop when all_tasks_complete=true.",
+                "",
+                "After all tasks have been finalized, give one short final answer summarizing the per-task completion status.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "For each task:",
+                "- Use only that task's MCP toolset while solving that task.",
+                "- Call at most one TongSIM MCP tool in each assistant response. After any TongSIM tool call, stop immediately and wait for its tool result before calling another TongSIM tool.",
+                "- Do not batch observe_current_state, choose_action, or check_task_status in the same assistant response.",
+                "- Start by calling observe_current_state.",
+                "- Do not call list_prompts/get_prompt or try to retrieve a separate task prompt; observe_current_state is the only way to receive the current task instruction.",
+                "- Use the attached observation image and visual evidence as the primary source of truth.",
+                "- Choose exactly one exposed action template for each step.",
+                "- Keep template_id exactly equal to the exposed candidate name, such as look_at_{object} or place_{object1}_on_{object2}.",
+                "- Never substitute object ids into template_id.",
+                "- Bind each placeholder to exactly one provided object_id.",
+                "- Do not invent object aliases when object_id values are provided.",
+                "- If the previous action made no progress, choose a different action or target.",
+                "- When the environment reports done=true, the runtime advances automatically; call observe to continue the next task or stop when all_tasks_complete=true.",
+                "",
+                "After all tasks have been finalized, give one short final answer summarizing the per-task completion status.",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _start_bridge(runtime_root: Path, session: FrameworkSession) -> subprocess.Popen[str]:
+    bridge_script = ROOT / "scripts" / "tongsim_framework_bridge.py"
+    return subprocess.Popen(
+        [
+            current_python(),
+            str(bridge_script),
+            "serve",
+            "--runtime-root",
+            str(runtime_root),
+            "--session-id",
+            session.session_id,
+        ],
+        cwd=ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+    )
+
+
+def _create_sessions(
+    *,
+    runtime: TongSimFrameworkRuntime,
+    runtime_root: Path,
+    run_dir: Path,
+    steps: list[DialogueStep],
+    args: argparse.Namespace,
+) -> tuple[list[DialogueStep], list[subprocess.Popen[str]], list[dict[str, str]]]:
+    public_workspace = run_dir / "agent_workspace"
+    public_exec_workspace = public_workspace / "exec"
+    public_exec_workspace.mkdir(parents=True, exist_ok=True)
+    bridge_processes: list[subprocess.Popen[str]] = []
+    bind_mounts: list[dict[str, str]] = []
+
+    for step in steps:
+        step_workspace = public_exec_workspace / step.workspace_name
+        session = runtime.create_session(
+            task_dir=step.graph_path,
+            output_dir=step.output_dir,
+            action_interface=args.action_interface,
+            action_library_mode=args.action_library_mode,
+            atomic_template_path=Path(args.atomic_template_path).resolve() if args.atomic_template_path else None,
+            subtask_template_path=Path(args.subtask_template_path).resolve() if args.subtask_template_path else None,
+            exclusive_in_view=str(args.exclusive_in_view).lower() == "true",
+            max_steps=int(step.max_steps),
+            public_interface_mode=args.public_interface_mode,
+            public_workspace_dir=step_workspace,
+            unique_state_image_dir=step.unique_state_image_dir,
+            decision_only=bool(args.decision_only),
+            generic_invalid_action_feedback=bool(args.generic_invalid_action_feedback),
+            description_field=args.description_field,
+            protocol_surface=args.protocol_surface,
+            choice_count=int(args.choice_count),
+            choice_seed=int(args.choice_seed),
+            choice_bank_path=Path(args.choice_bank_jsonl).resolve() if args.choice_bank_jsonl else None,
+            write_human_trace_md=bool(args.write_human_trace_md),
+        )
+        bridge_mount = (
+            str(Path(session.bridge_dir).resolve())
+            if is_native_runtime(getattr(args, "runtime", None))
+            else f"/tongsim_bridge_{step.index:02d}"
+        )
+        _allow_container_bridge_writes(Path(session.bridge_dir))
+        _rewrite_session_config(step_workspace, bridge_mount)
+        step.session = session
+        bridge_processes.append(_start_bridge(runtime_root, session))
+        bind_mounts.append(
+            {
+                "host_path": str(Path(session.bridge_dir).resolve()),
+                "container_path": bridge_mount,
+                "mode": "rw",
+            }
+        )
+    return steps, bridge_processes, bind_mounts
+
+
+def _write_choice_sequence_config(
+    public_exec_workspace: Path,
+    steps: list[DialogueStep],
+    *,
+    native_task_id: str | None = None,
+) -> Path:
+    mcp_server_script = ROOT / "src" / "tongbench_eval" / "mcp" / "server.py"
+    shutil.copy2(mcp_server_script, public_exec_workspace / "tongsim_mcp_server.py")
+    shutil.copy2(mcp_server_script.with_name("context_compact.py"), public_exec_workspace / "context_compact.py")
+    payload = {
+        "sequence_steps": [
+            {
+                "index": step.index,
+                "bridge_mount": (
+                    str(Path(step.session.bridge_dir).resolve())
+                    if native_task_id and step.session is not None
+                    else f"/tongsim_bridge_{step.index:02d}"
+                ),
+            }
+            for step in steps
+        ],
+        "sequence_state_path": (
+            native_path(native_task_id, "/tmp_workspace/.choice_sequence_state.json")
+            if native_task_id
+            else "/tmp_workspace/.choice_sequence_state.json"
+        ),
+        "observation_subdir": "current_observation",
+        "protocol_surface": "safe_choice",
+    }
+    config_path = public_exec_workspace / ".tongsim_sequence_session.json"
+    _write_json(config_path, payload)
+    return config_path
+
+
+def _choice_sequence_mcp_servers(
+    public_exec_workspace: Path,
+    python_command: str,
+    *,
+    backend: str,
+    direct_image_input: bool = False,
+    no_image_input: bool = False,
+    compress_images: bool = False,
+    context_mode: str = "full",
+    image_max_side: int | None = None,
+    image_max_base64_chars: int | None = None,
+    image_jpeg_quality: int | None = None,
+) -> dict[str, Any]:
+    _ = public_exec_workspace
+    env = mcp_image_env(
+        backend=backend,
+        no_image_input=no_image_input,
+        direct_image_input=direct_image_input,
+        compress_images=compress_images,
+        context_mode=context_mode,
+        image_max_side=image_max_side,
+        image_max_base64_chars=image_max_base64_chars,
+        image_jpeg_quality=image_jpeg_quality,
+    )
+    return {
+        "household_task": {
+            "command": python_command,
+            "args": [
+                "/tmp_workspace/tongsim_mcp_server.py",
+                "--session-config",
+                "/tmp_workspace/.tongsim_sequence_session.json",
+            ],
+            "env": env,
+            "timeout": 120,
+            "connect_timeout": 60,
+            "enabled_tools": list(SAFE_CHOICE_MCP_TOOL_NAMES),
+        }
+    }
+
+
+def _mcp_servers_for_steps(
+    steps: list[DialogueStep],
+    python_command: str,
+    *,
+    text_only: bool = False,
+    image_content_only: bool = False,
+    anthropic_image_blocks: bool = False,
+    compress_images: bool = False,
+    context_mode: str = "full",
+    image_max_side: int | None = None,
+    image_max_base64_chars: int | None = None,
+    image_jpeg_quality: int | None = None,
+) -> dict[str, Any]:
+    servers: dict[str, Any] = {}
+    for step in steps:
+        env = {
+            "TONGSIM_MCP_TEXT_ONLY": "1",
+            "TONGSIM_MCP_CONTEXT_MODE": str(context_mode),
+        } if text_only else {"TONGSIM_MCP_CONTEXT_MODE": str(context_mode)}
+        if image_content_only:
+            env["TONGSIM_MCP_IMAGE_CONTENT_ONLY"] = "1"
+        if anthropic_image_blocks:
+            env["TONGSIM_MCP_ANTHROPIC_IMAGE_BLOCKS"] = "1"
+        if compress_images:
+            env["TONGSIM_MCP_COMPRESS_IMAGES"] = "1"
+            if image_max_side is not None:
+                env["TONGSIM_MCP_IMAGE_MAX_SIDE"] = str(int(image_max_side))
+            if image_max_base64_chars is not None:
+                env["TONGSIM_MCP_IMAGE_MAX_BASE64_CHARS"] = str(int(image_max_base64_chars))
+            if image_jpeg_quality is not None:
+                env["TONGSIM_MCP_IMAGE_JPEG_QUALITY"] = str(int(image_jpeg_quality))
+        servers[step.server_name] = {
+            "command": python_command,
+            "args": [
+                f"/tmp_workspace/{step.workspace_name}/tongsim_mcp_server.py",
+                "--session-config",
+                f"/tmp_workspace/{step.workspace_name}/.tongsim_session.json",
+            ],
+            "env": env,
+            "timeout": 120,
+            "connect_timeout": 60,
+        }
+    return servers
+
+
+def _codex_mcp_servers(
+    mcp_servers: dict[str, Any],
+    *,
+    tool_names: tuple[str, ...] = LEGACY_MCP_TOOL_NAMES,
+) -> dict[str, Any]:
+    return codex_mcp_servers(mcp_servers, tool_names=tool_names)
+
+
+def _write_codex_sequence_mcp_server(
+    public_exec_workspace: Path,
+    steps: list[DialogueStep],
+    *,
+    hide_decomposition: bool = False,
+    native_task_id: str | None = None,
+) -> Path:
+    workspace_prefix = (
+        native_path(native_task_id, "/tmp_workspace")
+        if native_task_id
+        else "/tmp_workspace"
+    )
+    step_payload = [
+        {
+            "index": step.index,
+            "task_id": step.task_id,
+            "level": step.level,
+            "session_label": f"session_{step.index:02d}",
+            "workspace": f"{workspace_prefix}/{step.workspace_name}",
+        }
+        for step in steps
+    ]
+    script = f'''from __future__ import annotations
+
+import base64
+import io
+import json
+import mimetypes
+import os
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+from typing import Any
+
+try:
+    from mcp.server.fastmcp import FastMCP
+except Exception as exc:
+    raise SystemExit(f"Missing MCP runtime: {{exc}}")
+
+
+STEPS = {json.dumps(step_payload, ensure_ascii=False, indent=2)}
+HIDE_DECOMPOSITION = {repr(bool(hide_decomposition))}
+STATE_PATH = Path({workspace_prefix!r} + "/.tongsim_sequence_state.json")
+
+
+def _read_state() -> dict[str, Any]:
+    if STATE_PATH.exists():
+        try:
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {{"current_index": 0}}
+
+
+def _write_state(state: dict[str, Any]) -> None:
+    STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _current_index() -> int:
+    state = _read_state()
+    index = int(state.get("current_index", 0))
+    return max(0, min(index, len(STEPS)))
+
+
+def _current_step() -> dict[str, Any] | None:
+    index = _current_index()
+    if index >= len(STEPS):
+        return None
+    return STEPS[index]
+
+
+def _sequence_context(step: dict[str, Any] | None = None) -> dict[str, Any]:
+    index = _current_index()
+    current = step if step is not None else _current_step()
+    if HIDE_DECOMPOSITION:
+        return {{
+            "current_step_index": index + 1 if current else None,
+            "current_session": current.get("session_label") if current else None,
+            "total_sessions": len(STEPS),
+            "remaining_session_count": len(STEPS[index:]),
+            "all_tasks_finalized": current is None,
+        }}
+    return {{
+        "current_step_index": index + 1 if current else None,
+        "current_task_id": current.get("task_id") if current else None,
+        "current_level": current.get("level") if current else None,
+        "total_tasks": len(STEPS),
+        "remaining_task_ids": [item["task_id"] for item in STEPS[index:]],
+        "all_tasks_finalized": current is None,
+    }}
+
+
+def _with_sequence_context(result: dict[str, Any], step: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {{**result, "sequence_context": _sequence_context(step)}}
+
+
+def _text_only_mcp_mode() -> bool:
+    return os.environ.get("TONGSIM_MCP_TEXT_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _expose_image_paths_mode() -> bool:
+    return os.environ.get("TONGSIM_MCP_EXPOSE_IMAGE_PATHS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _image_content_only_mode() -> bool:
+    return os.environ.get("TONGSIM_MCP_IMAGE_CONTENT_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _anthropic_image_blocks_mode() -> bool:
+    return os.environ.get("TONGSIM_MCP_ANTHROPIC_IMAGE_BLOCKS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _compress_images_mode() -> bool:
+    return os.environ.get("TONGSIM_MCP_COMPRESS_IMAGES", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _response_image_paths(payload: dict[str, Any]) -> list[str]:
+    image_paths = [str(path) for path in payload.get("image_paths", []) or [] if str(path).strip()]
+    next_observation = payload.get("next_observation")
+    if isinstance(next_observation, dict):
+        image_paths.extend(str(path) for path in next_observation.get("image_paths", []) or [] if str(path).strip())
+    return image_paths
+
+
+def _scrub_observation_text_image_paths(text: str) -> str:
+    lines: list[str] = []
+    attached_line_added = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if os.environ.get("TONGSIM_MCP_NO_IMAGE_INPUT", "").strip().lower() in ("1", "true", "yes", "on") and line == "Current image: attached.":
+            lines.append("Current image: none.")
+            continue
+        if line.startswith("- Image "):
+            continue
+        if line.startswith("Images available:") and "none" not in line.lower():
+            if _text_only_mcp_mode():
+                continue
+            if not attached_line_added:
+                lines.append("Current observation image: attached.")
+                attached_line_added = True
+            continue
+        lines.append(raw_line)
+    return "\\n".join(lines)
+
+
+def _model_visible_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        visible: dict[str, Any] = {{}}
+        for key, item in value.items():
+            if key == "image_paths" and not _expose_image_paths_mode():
+                continue
+            if key in {{"reached_goal", "confidence"}}:
+                continue
+            if key == "observation_text" and isinstance(item, str):
+                visible[key] = _scrub_observation_text_image_paths(item)
+            else:
+                visible[key] = _model_visible_payload(item)
+        return visible
+    if isinstance(value, list):
+        return [_model_visible_payload(item) for item in value]
+    return value
+
+
+def _text_content(text: str) -> Any:
+    if _anthropic_image_blocks_mode():
+        return {{"type": "text", "text": text}}
+    try:
+        from mcp.types import TextContent
+
+        return TextContent(type="text", text=text)
+    except Exception:
+        return {{"type": "text", "text": text}}
+
+
+def _image_mime_type(image_path: Path, image_bytes: bytes | None = None) -> str:
+    if image_bytes is not None:
+        header = image_bytes[:32]
+    else:
+        try:
+            with image_path.open("rb") as handle:
+                header = handle.read(32)
+        except OSError:
+            header = b""
+
+    if header.startswith(b"\\xff\\xd8\\xff"):
+        return "image/jpeg"
+    if header.startswith(b"\\x89PNG\\r\\n\\x1a\\n"):
+        return "image/png"
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return "image/webp"
+    if header.startswith(b"BM"):
+        return "image/bmp"
+    if header.startswith((b"II*\\x00", b"MM\\x00*")):
+        return "image/tiff"
+
+    guessed = mimetypes.guess_type(str(image_path))[0]
+    return guessed if guessed and guessed.startswith("image/") else "image/jpeg"
+
+
+def _image_format_from_mime(mime_type: str) -> str:
+    subtype = mime_type.split("/", 1)[-1].lower()
+    return "jpeg" if subtype in ("jpg", "jpeg") else subtype
+
+
+def _base64_char_count(image_bytes: bytes) -> int:
+    return ((len(image_bytes) + 2) // 3) * 4
+
+
+def _image_bytes_for_model(image_path: Path) -> tuple[bytes, str]:
+    image_bytes = image_path.read_bytes()
+    mime_type = _image_mime_type(image_path, image_bytes)
+    if not _compress_images_mode():
+        return image_bytes, mime_type
+
+    max_base64_chars = _env_int("TONGSIM_MCP_IMAGE_MAX_BASE64_CHARS", 70000, minimum=4096)
+    if _base64_char_count(image_bytes) <= max_base64_chars:
+        return image_bytes, mime_type
+
+    try:
+        from PIL import Image as PILImage
+    except Exception:
+        return image_bytes, mime_type
+
+    max_side = _env_int("TONGSIM_MCP_IMAGE_MAX_SIDE", 768, minimum=64, maximum=4096)
+    quality = _env_int("TONGSIM_MCP_IMAGE_JPEG_QUALITY", 70, minimum=10, maximum=95)
+    side_candidates: list[int] = []
+    for side in (max_side, 1024, 896, 768, 640, 512, 384):
+        if side <= max_side and side not in side_candidates:
+            side_candidates.append(side)
+    if not side_candidates:
+        side_candidates.append(max_side)
+    quality_candidates: list[int] = []
+    for candidate_quality in (quality, 80, 75, 70, 65, 60, 55, 50):
+        if candidate_quality <= quality and candidate_quality not in quality_candidates:
+            quality_candidates.append(candidate_quality)
+    if not quality_candidates:
+        quality_candidates.append(quality)
+
+    try:
+        with PILImage.open(io.BytesIO(image_bytes)) as opened:
+            image = opened.convert("RGB")
+            resampling = getattr(PILImage, "Resampling", None)
+            resample_filter = getattr(resampling, "LANCZOS", getattr(PILImage, "LANCZOS", PILImage.BICUBIC))
+            best_bytes: bytes | None = None
+            for side in side_candidates:
+                resized = image.copy()
+                width, height = resized.size
+                longest_side = max(width, height)
+                if longest_side > side:
+                    scale = side / float(longest_side)
+                    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+                    resized = resized.resize(new_size, resample_filter)
+                for candidate_quality in quality_candidates:
+                    buffer = io.BytesIO()
+                    resized.save(buffer, format="JPEG", quality=candidate_quality, optimize=True)
+                    candidate_bytes = buffer.getvalue()
+                    if best_bytes is None or len(candidate_bytes) < len(best_bytes):
+                        best_bytes = candidate_bytes
+                    if _base64_char_count(candidate_bytes) <= max_base64_chars:
+                        return candidate_bytes, "image/jpeg"
+            if best_bytes is not None and len(best_bytes) < len(image_bytes):
+                return best_bytes, "image/jpeg"
+    except Exception:
+        return image_bytes, mime_type
+
+    return image_bytes, mime_type
+
+
+def _image_content(image_path: Path) -> Any | None:
+    if not image_path.exists() or not image_path.is_file():
+        return None
+    image_bytes = (
+        _image_bytes_for_model(image_path)[0]
+        if (_image_content_only_mode() or _anthropic_image_blocks_mode())
+        else None
+    )
+    mime_type = _image_mime_type(image_path, image_bytes)
+    if _anthropic_image_blocks_mode():
+        encoded = base64.b64encode(image_bytes or b"").decode("ascii")
+        return {{
+            "type": "image",
+            "source": {{
+                "type": "base64",
+                "media_type": mime_type,
+                "data": encoded,
+            }},
+        }}
+    if _image_content_only_mode():
+        encoded = base64.b64encode(image_bytes or b"").decode("ascii")
+        try:
+            from mcp.types import ImageContent
+
+            return ImageContent(type="image", data=encoded, mimeType=mime_type)
+        except Exception:
+            return {{"type": "image", "data": encoded, "mimeType": mime_type}}
+
+    try:
+        from mcp.server.fastmcp import Image
+
+        image_format = _image_format_from_mime(mime_type)
+        try:
+            return Image(path=str(image_path), format=image_format)
+        except TypeError:
+            return Image(path=str(image_path))
+    except Exception:
+        pass
+
+    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    try:
+        from mcp.types import ImageContent
+
+        return ImageContent(type="image", data=encoded, mimeType=mime_type)
+    except Exception:
+        return {{"type": "image", "data": encoded, "mimeType": mime_type}}
+
+
+def _content_response_with_images(payload: dict[str, Any]) -> Any:
+    image_paths = _response_image_paths(payload)
+    visible_payload = _model_visible_payload(payload)
+    if _text_only_mcp_mode() or not image_paths:
+        return visible_payload
+
+    text_payload = json.dumps(visible_payload, indent=2, ensure_ascii=False)
+    content_blocks: list[Any] = [_text_content(text_payload)]
+    for image_path in image_paths:
+        image_content = _image_content(Path(image_path))
+        if image_content is not None:
+            content_blocks.append(image_content)
+    return content_blocks if len(content_blocks) > 1 else visible_payload
+
+
+def _is_terminal_result(step: dict[str, Any], result: dict[str, Any]) -> bool:
+    _ = step
+    if bool(result.get("done", False)):
+        return True
+    next_observation = result.get("next_observation")
+    if isinstance(next_observation, dict) and bool(next_observation.get("done", False)):
+        return True
+    return False
+
+
+def _advance_sequence() -> None:
+    state = _read_state()
+    state["current_index"] = min(int(state.get("current_index", 0)) + 1, len(STEPS))
+    _write_state(state)
+
+
+def _finish_and_advance(step: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    _advance_sequence()
+    state = _read_state()
+    all_complete = int(state.get("current_index", 0)) >= len(STEPS)
+    return {{
+        **result,
+        "task_complete": True,
+        "all_tasks_complete": all_complete,
+        "message": (
+            "All tasks are complete. Stop using task tools."
+            if all_complete
+            else "The current task is complete. Call observe to begin the next task."
+        ),
+    }}

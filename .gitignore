@@ -1,0 +1,40 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+
+.env
+.env.local
+.env.*.local
+my_api.json
+
+*.log
+*.tmp
+*.bak
+*.bak*
+
+/important_results*/
+/output/
+/outputs_runtime/
+/tmp/
+
+# Large experiment inputs, outputs, and prepared runtime state.
+/For_user/analyze/output/
+/For_user/analyze/prepared/
+/For_user/analyze/validation/
+/For_user/analyze/L_N/input/
+/For_user/analyze/N-sample/input/
+/For_user/runtime_download/
+/analyze/**/input/
+/analyze/**/output/
+/analyze/**/reports/
+/analyze/**/scaleup_v1/
+/analyze/**/source_manifest.json
+
+# Generated Python package metadata and caches under the intentionally tracked
+# evaluation workspace tree.
+/public/eval/src/tongbench_eval_refactor.egg-info/
+/public/eval/src/tongbench_eval/graph_env/workspace/**/__pycache__/

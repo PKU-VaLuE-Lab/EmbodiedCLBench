@@ -1,0 +1,650 @@
+                }
+            )
+            reason = "A required target argument was missing."
+        same_type_bindings = [binding for binding in bindings if binding["action_type"] == action_type]
+        if not violations and object_id is not None:
+            valid_objects_for_type = {
+                binding["object_id"] for binding in same_type_bindings if binding.get("object_id") is not None
+            }
+            if valid_objects_for_type and object_id not in valid_objects_for_type:
+                violations.append(
+                    {
+                        "type": "object_not_valid_for_action",
+                        "message": "The chosen object_id is not valid for the selected action_type in this state.",
+                    }
+                )
+                reason = "The selected object is not executable with that action_type right now."
+        if not violations and normalized_target_id is not None:
+            object_filtered = same_type_bindings
+            if object_id is not None:
+                object_filtered = [
+                    binding
+                    for binding in same_type_bindings
+                    if binding.get("object_id") in {None, object_id}
+                ]
+            valid_targets_for_type = {
+                binding["target_id"] for binding in object_filtered if binding.get("target_id") is not None
+            }
+            if valid_targets_for_type and normalized_target_id not in valid_targets_for_type:
+                violations.append(
+                    {
+                        "type": "target_not_valid_for_action",
+                        "message": "The chosen target_id is not valid for the selected action_type in this state.",
+                    }
+                )
+                reason = "The selected target is not executable with that action_type right now."
+        if not violations:
+            violations.append(
+                {
+                    "type": "no_matching_transition",
+                    "message": "The chosen action arguments do not match any executable transition in the current state.",
+                }
+            )
+            reason = "No executable transition matches the chosen factorized action."
+
+    report = {
+        "valid": False,
+        "error_type": "invalid_factorized_action",
+        "invalid_action": {
+            "action_type": action_type,
+            "object_id": object_id,
+            "target_id": normalized_target_id,
+        },
+        "reason": reason,
+        "current_state_id": current_id,
+        "current_depth": current_depth,
+        "current_state_predicates": list(current_state_predicates),
+        "available_action_types": available_action_types,
+        "available_objects": available_objects,
+        "available_targets": available_targets,
+        "constraint_violations": violations,
+        "recovery_hint": "The previous action could not be executed in the current state. Reconsider the current executable action types, objects, targets, and state predicates.",
+    }
+    report["diagnostic"] = {
+        "error_type": report["error_type"],
+        "reason": report["reason"],
+        "invalid_action": dict(report["invalid_action"]),
+        "constraint_violations": list(report["constraint_violations"]),
+        "recovery_hint": report["recovery_hint"],
+    }
+    return report
+
+
+def _build_global_factorized_report(
+    task: dict[str, Any],
+    current_id: str,
+    current_depth: int,
+    current_state_predicates: list[str],
+    action_type: str | None,
+    object_id: str | None,
+    target_id: str | None,
+) -> dict[str, Any]:
+    task_objects = _task_object_ids(task)
+    executable = check_action_executable(
+        action_type=action_type or "",
+        object_id=object_id,
+        target_id=target_id,
+        current_predicates=current_state_predicates,
+        task_objects=task_objects,
+    )
+    normalized = executable["normalized_action"]
+    selected_action_type = str(normalized.get("action_type") or action_type or "")
+    selected_object_id = normalized.get("object_id")
+    selected_target_id = normalized.get("target_id")
+    matched_edge = None
+    if executable["executable_by_state"]:
+        matched_edge = find_matching_transition(
+            current_node_id=current_id,
+            action_type=selected_action_type,
+            object_id=selected_object_id,
+            target_id=selected_target_id,
+            task=task,
+        )
+    transition_status = "matched_transition" if matched_edge is not None else (
+        "executable_but_no_transition" if executable["executable_by_state"] else "not_executable_by_state"
+    )
+    diagnostic_error_type = "graph_coverage_gap_or_unmodeled_transition" if transition_status == "executable_but_no_transition" else (
+        "invalid_action" if transition_status == "not_executable_by_state" else "none"
+    )
+    reason = (
+        "No matching offline DAG transition exists for this executable action in the current node."
+        if transition_status == "executable_but_no_transition"
+        else "The selected action violates current state constraints."
+    )
+    available_objects, available_targets = _available_objects_and_targets(task, current_state_predicates)
+    report = {
+        "valid": matched_edge is not None,
+        "transition_status": transition_status,
+        "selected_action_type": selected_action_type,
+        "selected_object_id": selected_object_id,
+        "selected_target_id": selected_target_id,
+        "executable_by_state": bool(executable["executable_by_state"]),
+        "matched_transition": matched_edge is not None,
+        "error_type": diagnostic_error_type,
+        "current_state_id": current_id,
+        "current_depth": current_depth,
+        "current_state_predicates": list(current_state_predicates),
+        "available_action_types": [item["action_type"] for item in build_global_action_types(task)],
+        "available_objects": available_objects,
+        "available_targets": available_targets,
+        "precondition_violations": list(executable["precondition_violations"]),
+        "diagnostic": {
+            "error_type": diagnostic_error_type,
+            "reason": reason,
+            "invalid_action": {
+                "action_type": selected_action_type,
+                "object_id": selected_object_id,
+                "target_id": selected_target_id,
+            },
+            "precondition_violations": list(executable["precondition_violations"]),
+            "transition_lookup": {
+                "matched_transition": matched_edge is not None,
+                "message": (
+                    "No matching offline DAG transition exists for this executable action in the current node."
+                    if matched_edge is None
+                    else "A matching offline DAG transition was found."
+                ),
+            },
+            "recovery_hint": "The action was not executed. Reconsider the current state predicates and choose another action, object, or target.",
+        },
+    }
+    return report
+
+
+def _normalize_role_bindings(role_bindings: dict[str, str] | None) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for raw_key, raw_value in dict(role_bindings or {}).items():
+        key = str(raw_key).strip()
+        while key.startswith("{") and key.endswith("}") and len(key) > 2:
+            inner = key[1:-1].strip()
+            if not inner or inner == key:
+                break
+            key = inner
+        value_text = str(raw_value).strip()
+        if not key or not value_text:
+            continue
+        raw_key_text = str(raw_key).strip()
+        if key in normalized and raw_key_text != key:
+            continue
+        normalized[key] = value_text
+    return normalized
+
+
+def _apply_step(
+    workspace_dir: Path,
+    action_id: str | None = None,
+    action_level: str | None = None,
+    template_id: str | None = None,
+    action_type: str | None = None,
+    object_id: str | None = None,
+    target_id: str | None = None,
+    role_bindings: dict[str, str] | None = None,
+    parse_error: str | None = None,
+    raw_response: str | None = None,
+    parsed_json: dict[str, Any] | None = None,
+    parse_error_details: dict[str, Any] | None = None,
+    action_interface: str = "full_action",
+    action_library_mode: str = "atomic_only",
+    atomic_template_path: str | None = None,
+    subtask_template_path: str | None = None,
+    exclusive_in_view: bool = True,
+) -> dict[str, Any]:
+    task = _load_task(workspace_dir)
+    nodes = _nodes_by_id(task)
+    state = _load_env_state(workspace_dir, task)
+    current_id = str(state["current_state_id"])
+    current_render_node_id = str(state.get("render_node_id") or current_id)
+    current_node = nodes.get(current_id)
+    current_depth = int(state.get("current_depth", current_node.get("depth", 0) if current_node else 0))
+    current_state_predicates = _normalize_state(state.get("current_state_predicates", _normalize_state(current_node.get("state")) if current_node else []))
+    current_images = list(state.get("image_paths", _image_paths(workspace_dir, current_render_node_id) if current_node else []))
+    current_observation_status = state.get("observation_status", "rendered_node_observation")
+    current_observation_warning = state.get("observation_warning")
+    current_step_count = int(state.get("step_count", 0))
+    max_steps = int(state.get("max_steps", 30))
+    if current_step_count >= max_steps:
+        if not bool(state.get("done", False)):
+            state["done"] = True
+            _save_env_state(workspace_dir, state)
+        return {
+            "valid": False,
+            "execution_status": "episode_already_done",
+            "from_state": current_id,
+            "current_state_id": current_id,
+            "to_state": current_id,
+            "render_node_id": current_render_node_id if not bool(state.get("is_virtual_state", False)) else None,
+            "is_virtual_state": bool(state.get("is_virtual_state", False)),
+            "selected_action_id": action_id,
+            "selected_action_level": action_level,
+            "selected_template_id": template_id,
+            "selected_action_type": action_type,
+            "selected_role_bindings": dict(role_bindings or {}),
+            "canonical_action": action_id,
+            "executable_by_state": False,
+            "normalized_current_state_predicates": list(current_state_predicates),
+            "normalized_goal_state": _normalize_state(task.get("goal_state")),
+            "instantiated_pre_state": [],
+            "satisfied_preconditions": [],
+            "missing_preconditions": [],
+            "state_update": {
+                "previous_state_predicates": list(current_state_predicates),
+                "raw_add_effects": [],
+                "raw_delete_effects": [],
+                "add_effects": [],
+                "delete_effects": [],
+                "consistency_adds": [],
+                "consistency_deletes": [],
+                "consistency_rules_applied": [],
+                "new_state_predicates": list(current_state_predicates),
+                "normalized_new_state_predicates": list(current_state_predicates),
+            },
+            "dag_alignment": {"status": "episode_already_done", "canonical_action": None, "matched_edge_to_state": None, "render_node_id": None},
+            "observation_status": current_observation_status,
+            "observation_warning": current_observation_warning,
+            "reached_goal": bool(state.get("reached_goal", False)),
+            "done": True,
+            "state_changed": False,
+            "diagnostic": {
+                "error_type": "episode_already_done",
+                "reason": "The episode has already reached the max_steps limit, so no further actions can be executed.",
+                "step_count": current_step_count,
+                "max_steps": max_steps,
+                "reached_goal": bool(state.get("reached_goal", False)),
+            },
+        }
+    actions = _candidate_actions(task, current_id) if current_node is not None else []
+    valid = False
+    matched_edge: dict[str, Any] | None = None
+    matched_action_id: str | None = None
+    selected_action_level = action_level
+    selected_template_id = template_id
+    selected_action_type = action_type
+    selected_object_id = object_id
+    selected_target_id = target_id
+    selected_role_bindings = _normalize_role_bindings(role_bindings)
+    canonical_action: str | None = None
+    state_update: dict[str, Any] = {
+        "raw_add_effects": [],
+        "raw_delete_effects": [],
+        "add_effects": [],
+        "delete_effects": [],
+        "consistency_adds": [],
+        "consistency_deletes": [],
+        "consistency_rules_applied": [],
+        "previous_state_predicates": list(current_state_predicates),
+        "new_state_predicates": list(current_state_predicates),
+        "normalized_new_state_predicates": list(current_state_predicates),
+    }
+    instantiated_pre_state: list[str] = []
+    satisfied_preconditions: list[str] = []
+    missing_preconditions: list[str] = []
+    dag_alignment = {"status": "not_checked", "canonical_action": None, "matched_edge_to_state": None, "render_node_id": None}
+    previous_action_report = state.get("previous_action_report")
+    previous_invalid_action_report = state.get("previous_invalid_action_report")
+    invalid_report: dict[str, Any] | None = None
+    transition_status = "matched_transition" if action_id is not None else "parse_error"
+    executable_by_state: bool | None = None
+    matched_transition = False
+    execution_status = "parse_error"
+
+    if action_interface == "library_factorized":
+        atomic_library = load_atomic_templates(_resolve_template_path(atomic_template_path, "TONGSIM_ATOMIC_TEMPLATE_PATH", "tests/fixtures/atomic_templates.json"))
+        subtask_library = load_subtask_templates(_resolve_template_path(subtask_template_path, "TONGSIM_SUBTASK_TEMPLATE_PATH", "tests/fixtures/subtask_templates.json"))
+        model_candidates = build_model_facing_action_candidates(
+            task,
+            current_state_predicates,
+            action_library_mode,
+            atomic_library,
+            subtask_library,
+        )
+        selected_candidate = _find_model_action_candidate(model_candidates, action_level, template_id, action_type)
+        if parse_error is not None:
+            execution_status = "parse_error"
+            executable_by_state = False
+            invalid_report = {
+                "error_type": "parse_error",
+                "reason": parse_error,
+                "model_selected_action": {
+                    "action_level": action_level,
+                    "template_id": template_id,
+                    "action_type": action_type,
+                    "role_bindings": dict(selected_role_bindings),
+                },
+                "parse_error": parse_error,
+                "parse_error_details": dict(parse_error_details or {}),
+                "raw_response": raw_response,
+                "parsed_json": dict(parsed_json or {}),
+                "executable_by_state": False,
+                "instantiated_pre_state": [],
+                "satisfied_preconditions": [],
+                "missing_preconditions": [],
+                "precondition_violations": [],
+                "recovery_hint": "The action was not executed. Use template preconditions, current predicates, object properties, and previous report to revise your next action.",
+            }
+        elif selected_candidate is None:
+            execution_status = "parse_error"
+            executable_by_state = False
+            invalid_report = {
+                "error_type": "parse_error",
+                "reason": "The selected action template is not part of the exposed action candidates.",
+                "model_selected_action": {
+                    "action_level": action_level,
+                    "template_id": template_id,
+                    "action_type": action_type,
+                    "role_bindings": dict(selected_role_bindings),
+                },
+                "executable_by_state": False,
+                "instantiated_pre_state": [],
+                "satisfied_preconditions": [],
+                "missing_preconditions": [],
+                "precondition_violations": [],
+                "recovery_hint": "The action was not executed. Use template preconditions, current predicates, object properties, and previous report to revise your next action.",
+            }
+        else:
+            selected_action_level = str(selected_candidate.get("action_level", action_level or ""))
+            selected_template_id = str(selected_candidate.get("template_id", template_id or ""))
+            selected_action_type = str(selected_candidate.get("action_type", action_type or ""))
+            canonical_action = _instantiate_library_action_to_canonical_action(
+                selected_action_level,
+                selected_template_id,
+                selected_action_type,
+                selected_role_bindings,
+            )
+            matched_action_id = canonical_action
+            if current_node is not None:
+                dag_alignment = _diagnose_dag_alignment(task, current_id, canonical_action)
+            executable = check_template_executable(
+                selected_action_candidate=selected_candidate,
+                role_bindings=selected_role_bindings,
+                current_state_predicates=current_state_predicates,
+                task_objects=_task_object_ids(task),
+            )
+            executable_by_state = bool(executable["executable_by_state"])
+            instantiated_pre_state = list(executable["instantiated_pre_state"])
+            satisfied_preconditions = list(executable["satisfied_preconditions"])
+            missing_preconditions = list(executable["missing_preconditions"])
+            if not executable_by_state:
+                execution_status = "not_executable_by_state"
+                invalid_report = {
+                    "error_type": "invalid_action",
+                    "reason": "The selected template preconditions are not satisfied in the current state.",
+                    "model_selected_action": {
+                        "action_level": selected_action_level,
+                        "template_id": selected_template_id,
+                        "action_type": selected_action_type,
+                        "role_bindings": dict(selected_role_bindings),
+                    },
+                    "executable_by_state": False,
+                    "instantiated_pre_state": instantiated_pre_state,
+                    "satisfied_preconditions": satisfied_preconditions,
+                    "missing_preconditions": missing_preconditions,
+                    "precondition_violations": list(executable["precondition_violations"]),
+                    "recovery_hint": "The action was not executed. Use template preconditions, current predicates, object properties, and previous report to revise your next action.",
+                }
+            else:
+                state_update = apply_template_effects(
+                    selected_action_candidate={**selected_candidate, "_exclusive_in_view": exclusive_in_view},
+                    role_bindings=selected_role_bindings,
+                    current_state_predicates=current_state_predicates,
+                )
+                matched_node = None
+                render_node_id: str | None = None
+                if dag_alignment["status"] == "matched_reference_edge" and dag_alignment.get("matched_edge_to_state"):
+                    render_node_id = str(dag_alignment["matched_edge_to_state"])
+                    matched_node = nodes.get(render_node_id)
+                    next_id = render_node_id
+                    next_depth = int(matched_node.get("depth", current_depth + 1)) if matched_node is not None else current_depth + 1
+                    is_virtual_state = False
+                    image_paths = _image_paths(workspace_dir, render_node_id)
+                    observation_status = "rendered_node_observation"
+                    observation_warning = None
+                    dag_alignment["render_node_id"] = render_node_id
+                else:
+                    aligned_node, alignment_status = _align_state_to_dag_node(task, state_update["new_state_predicates"], current_depth)
+                    dag_alignment["status"] = alignment_status
+                    if aligned_node is not None:
+                        next_id = str(aligned_node.get("id", ""))
+                        render_node_id = next_id
+                        dag_alignment["render_node_id"] = render_node_id
+                        next_depth = int(aligned_node.get("depth", current_depth))
+                        is_virtual_state = False
+                        image_paths = _image_paths(workspace_dir, render_node_id)
+                        observation_status = "rendered_node_observation"
+                        observation_warning = None
+                        matched_node = aligned_node
+                    else:
+                        next_id = f"virtual_step_{int(state.get('step_count', 0)) + 1}"
+                        render_node_id = None
+                        dag_alignment["render_node_id"] = None
+                        next_depth = current_depth + 1
+                        is_virtual_state = True
+                        image_paths = []
+                        observation_status = "virtual_state_no_rendered_observation"
+                        observation_warning = "The symbolic state has no matching rendered DAG node image."
+                normalized_goal_state = _normalize_state(task.get("goal_state"))
+                reached_goal = (
+                    set(normalized_goal_state).issubset(set(state_update["new_state_predicates"]))
+                    or (matched_node is not None and _is_goal(task, matched_node))
+                )
+                no_progress = list(current_state_predicates) == list(state_update["new_state_predicates"])
+                step_count = int(state.get("step_count", 0)) + 1
+                max_steps = int(state.get("max_steps", 30))
+                done = reached_goal or step_count >= max_steps
+                valid = True
+                execution_status = (
+                    "state_unchanged_no_progress"
+                    if no_progress
+                    else "state_updated_by_template_effect"
+                )
+                matched_transition = dag_alignment["status"] == "matched_reference_edge"
+                no_progress_report = None
+                if no_progress:
+                    no_progress_report = {
+                        "error_type": "no_progress_action",
+                        "reason": "The selected action was executable but did not change the current symbolic state.",
+                        "model_selected_action": {
+                            "action_level": selected_action_level,
+                            "template_id": selected_template_id,
+                            "action_type": selected_action_type,
+                            "role_bindings": dict(selected_role_bindings),
+                        },
+                        "executable_by_state": True,
+                        "instantiated_pre_state": instantiated_pre_state,
+                        "satisfied_preconditions": satisfied_preconditions,
+                        "missing_preconditions": [],
+                        "precondition_violations": [],
+                        "state_changed": False,
+                        "recovery_hint": "The previous action was executable but did not change the environment state. Reconsider whether another action or object would make progress.",
+                    }
+                next_state = {
+                    "current_state_id": next_id,
+                    "render_node_id": render_node_id,
+                    "current_depth": next_depth,
+                    "is_virtual_state": is_virtual_state,
+                    "reached_goal": reached_goal,
+                    "done": done,
+                    "step_count": step_count,
+                    "invalid_action_count": int(state.get("invalid_action_count", 0)),
+                    "max_steps": max_steps,
+                    "current_state_predicates": list(state_update["new_state_predicates"]),
+                    "image_paths": image_paths,
+                    "observation_status": observation_status,
+                    "observation_warning": observation_warning,
+                    "previous_invalid_action_report": None,
+                    "previous_action_report": no_progress_report,
+                }
+                trace_entry = {
+                    "step_index": int(state.get("step_count", 0)),
+                    "observation_image_paths": list(current_images),
+                    "current_state_id": current_id,
+                    "render_node_id": current_render_node_id if not bool(state.get("is_virtual_state", False)) else None,
+                    "current_depth": current_depth,
+                    "current_state_predicates": list(current_state_predicates),
+                    "normalized_current_state_predicates": list(current_state_predicates),
+                    "normalized_goal_state": list(normalized_goal_state),
+                    "selected_action_id": canonical_action,
+                    "selected_action_level": selected_action_level,
+                    "selected_template_id": selected_template_id,
+                    "selected_action_type": selected_action_type,
+                    "selected_role_bindings": dict(selected_role_bindings),
+                    "canonical_action": canonical_action,
+                    "valid": True,
+                    "execution_status": execution_status,
+                    "executable_by_state": True,
+                    "instantiated_pre_state": instantiated_pre_state,
+                    "satisfied_preconditions": satisfied_preconditions,
+                    "missing_preconditions": missing_preconditions,
+                    "state_update": state_update,
+                    "dag_alignment": dag_alignment,
+                    "from_state": current_id,
+                    "to_state": next_id,
+                    "from_state_predicates": list(current_state_predicates),
+                    "to_state_predicates": list(state_update["new_state_predicates"]),
+                    "current_predicates": list(state_update["new_state_predicates"]),
+                    "render_node_id_after": render_node_id,
+                    "next_state_id": next_id,
+                    "next_depth": next_depth,
+                    "to_depth": next_depth,
+                    "from_depth": current_depth,
+                    "is_virtual_state": is_virtual_state,
+                    "observation_status": observation_status,
+                    "observation_warning": observation_warning,
+                    "reached_goal": reached_goal,
+                    "timestamp": _timestamp(),
+                    "previous_action_report": previous_action_report,
+                    "state_changed": not no_progress,
+                }
+                if no_progress_report is not None:
+                    trace_entry["diagnostic"] = no_progress_report
+                _append_trace(workspace_dir, trace_entry)
+                _save_env_state(workspace_dir, next_state)
+                return {
+                    "valid": True,
+                    "execution_status": execution_status,
+                    "from_state": current_id,
+                    "current_state_id": next_id,
+                    "to_state": next_id,
+                    "render_node_id": render_node_id,
+                    "is_virtual_state": is_virtual_state,
+                    "selected_action_id": canonical_action,
+                    "selected_action_level": selected_action_level,
+                    "selected_template_id": selected_template_id,
+                    "selected_action_type": selected_action_type,
+                    "selected_role_bindings": dict(selected_role_bindings),
+                    "canonical_action": canonical_action,
+                    "executable_by_state": True,
+                    "normalized_current_state_predicates": list(state_update["new_state_predicates"]),
+                    "normalized_goal_state": list(normalized_goal_state),
+                    "instantiated_pre_state": instantiated_pre_state,
+                    "satisfied_preconditions": satisfied_preconditions,
+                    "missing_preconditions": missing_preconditions,
+                    "state_update": {
+                        "previous_state_predicates": list(state_update["previous_state_predicates"]),
+                        "raw_add_effects": list(state_update["raw_add_effects"]),
+                        "raw_delete_effects": list(state_update["raw_delete_effects"]),
+                        "add_effects": list(state_update["add_effects"]),
+                        "delete_effects": list(state_update["delete_effects"]),
+                        "consistency_adds": list(state_update["consistency_adds"]),
+                        "consistency_deletes": list(state_update["consistency_deletes"]),
+                        "consistency_rules_applied": list(state_update["consistency_rules_applied"]),
+                        "new_state_predicates": list(state_update["new_state_predicates"]),
+                        "normalized_new_state_predicates": list(state_update["normalized_new_state_predicates"]),
+                    },
+                    "dag_alignment": dag_alignment,
+                    "observation_status": observation_status,
+                    "observation_warning": observation_warning,
+                    "reached_goal": reached_goal,
+                    "done": done,
+                    "state_changed": not no_progress,
+                    "diagnostic": (
+                        no_progress_report
+                        if no_progress_report is not None
+                        else {
+                            "reason": "The symbolic state was updated using template effects.",
+                            "effect_source": state_update.get("effect_source"),
+                        }
+                    ),
+                }
+
+        step_count = int(state.get("step_count", 0)) + 1
+        invalid_action_count = int(state.get("invalid_action_count", 0)) + 1
+        max_steps = int(state.get("max_steps", 30))
+        done = step_count >= max_steps
+        next_state = {
+            "current_state_id": current_id,
+            "render_node_id": current_render_node_id if not bool(state.get("is_virtual_state", False)) else None,
+            "current_depth": current_depth,
+            "is_virtual_state": bool(state.get("is_virtual_state", False)),
+            "reached_goal": bool(state.get("reached_goal", False)),
+            "done": done,
+            "step_count": step_count,
+            "invalid_action_count": invalid_action_count,
+            "max_steps": max_steps,
+            "current_state_predicates": list(current_state_predicates),
+            "image_paths": list(current_images),
+            "observation_status": current_observation_status,
+            "observation_warning": current_observation_warning,
+            "previous_invalid_action_report": None,
+            "previous_action_report": dict(invalid_report or {}),
+        }
+        trace_entry = {
+            "step_index": int(state.get("step_count", 0)),
+            "observation_image_paths": list(current_images),
+            "current_state_id": current_id,
+            "render_node_id": current_render_node_id if not bool(state.get("is_virtual_state", False)) else None,
+            "current_depth": current_depth,
+            "current_state_predicates": list(current_state_predicates),
+            "normalized_current_state_predicates": list(current_state_predicates),
+            "normalized_goal_state": _normalize_state(task.get("goal_state")),
+            "selected_action_id": canonical_action,
+            "selected_action_level": selected_action_level,
+            "selected_template_id": selected_template_id,
+            "selected_action_type": selected_action_type,
+            "selected_role_bindings": dict(selected_role_bindings),
+            "canonical_action": canonical_action,
+            "valid": False,
+            "execution_status": execution_status,
+            "executable_by_state": bool(executable_by_state),
+            "instantiated_pre_state": instantiated_pre_state,
+            "satisfied_preconditions": satisfied_preconditions,
+            "missing_preconditions": missing_preconditions,
+            "state_update": state_update,
+            "dag_alignment": dag_alignment,
+            "from_state": current_id,
+            "to_state": current_id,
+            "from_state_predicates": list(current_state_predicates),
+            "to_state_predicates": list(current_state_predicates),
+            "current_predicates": list(current_state_predicates),
+            "next_state_id": current_id,
+            "next_depth": current_depth,
+            "to_depth": current_depth,
+            "from_depth": current_depth,
+            "is_virtual_state": bool(state.get("is_virtual_state", False)),
+            "observation_status": current_observation_status,
+            "observation_warning": current_observation_warning,
+            "reached_goal": bool(state.get("reached_goal", False)),
+            "timestamp": _timestamp(),
+            "previous_action_report": previous_action_report,
+            "diagnostic": invalid_report,
+            "precondition_violations": list((invalid_report or {}).get("precondition_violations", [])),
+        }
+        _append_trace(workspace_dir, trace_entry)
+        _save_env_state(workspace_dir, next_state)
+        return {
+            "valid": False,
+            "execution_status": execution_status,
+            "from_state": current_id,
+            "current_state_id": current_id,
+            "to_state": current_id,
+            "render_node_id": current_render_node_id if not bool(state.get("is_virtual_state", False)) else None,
+            "is_virtual_state": bool(state.get("is_virtual_state", False)),
+            "selected_action_id": canonical_action,
+            "selected_action_level": selected_action_level,
+            "selected_template_id": selected_template_id,
+            "selected_action_type": selected_action_type,
+            "selected_role_bindings": dict(selected_role_bindings),
+            "canonical_action": canonical_action,
+            "executable_by_state": bool(executable_by_state),
+            "normalized_current_state_predicates": list(current_state_predicates),
+            "normalized_goal_state": _normalize_state(task.get("goal_state")),
+            "instantiated_pre_state": instantiated_pre_state,

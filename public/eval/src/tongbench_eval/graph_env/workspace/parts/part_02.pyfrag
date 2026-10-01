@@ -1,0 +1,650 @@
+        role_constraints = {
+            str(key): [str(value) for value in values]
+            for key, values in selected_action_candidate.get("role_constraints", {}).items()
+            if isinstance(values, list)
+        }
+        for role in required_roles:
+            object_id = _normalize_object_id_token(role_bindings.get(role))
+            if not object_id:
+                violations.append({"type": "missing_role_binding", "predicate": role, "message": f"Missing required role binding for {role}."})
+                continue
+            if object_id not in task_object_set:
+                violations.append({"type": "object_not_in_task_scope", "predicate": object_id, "message": f"{object_id} is not in task scope."})
+            canonical_selected_type = infer_object_type_from_id(object_id)
+            canonical_allowed_types = {normalize_object_type(str(item)) for item in role_constraints.get(role, [])}
+            if canonical_allowed_types and canonical_selected_type not in canonical_allowed_types:
+                violations.append({"type": "object_type_not_allowed_by_template", "predicate": object_id, "message": f"{object_id} does not satisfy the template type constraint for role {role}."})
+        for predicate in selected_action_candidate.get("pre_state", []):
+            instantiated = normalize_predicate(_instantiate_value(str(predicate), role_bindings))
+            instantiated_pre_state.append(instantiated)
+            if instantiated in current_state:
+                satisfied_preconditions.append(instantiated)
+            else:
+                missing_preconditions.append(instantiated)
+                violations.append({"type": "missing_precondition", "predicate": instantiated, "message": f"Missing required precondition: {instantiated}."})
+        return {
+            "executable_by_state": not violations,
+            "instantiated_pre_state": normalize_predicate_set(instantiated_pre_state),
+            "satisfied_preconditions": normalize_predicate_set(satisfied_preconditions),
+            "missing_preconditions": normalize_predicate_set(missing_preconditions),
+            "precondition_violations": violations,
+        }
+
+    def apply_template_effects(
+        selected_action_candidate: dict[str, Any],
+        role_bindings: dict[str, str],
+        current_state_predicates: list[str],
+    ) -> dict[str, Any]:
+        previous_state = normalize_predicate_set([str(value) for value in current_state_predicates])
+        current_state = set(previous_state)
+        action_level = str(selected_action_candidate.get("action_level", "subtask"))
+        raw_add_effects: list[str]
+        raw_delete_effects: list[str]
+        if action_level == "subtask":
+            raw_add = selected_action_candidate.get("net_add") or selected_action_candidate.get("post_state") or []
+            raw_delete = selected_action_candidate.get("net_delete") or []
+            raw_add_effects = normalize_predicate_set([_instantiate_value(str(value), role_bindings) for value in raw_add])
+            raw_delete_effects = normalize_predicate_set([_instantiate_value(str(value), role_bindings) for value in raw_delete])
+            effect_source = "net_add_net_delete" if selected_action_candidate.get("net_add") or selected_action_candidate.get("net_delete") else "post_state_with_derived_deletes"
+        else:
+            raw_add_effects = normalize_predicate_set([_instantiate_value(str(value), role_bindings) for value in selected_action_candidate.get("post_state", [])])
+            delete_effects: set[str] = set()
+            extra_adds: set[str] = set()
+            for predicate in raw_add_effects:
+                predicate = normalize_predicate(predicate)
+                args = _extract_ids_from_predicate(predicate)
+                if predicate.startswith("holding(") and args:
+                    delete_effects.add("empty")
+                if predicate == "empty":
+                    delete_effects.add("holding(*)")
+                if predicate.startswith("clean(") and args:
+                    delete_effects.add(f"dirty({args[0]})")
+                if predicate.startswith("dirty(") and args:
+                    delete_effects.add(f"clean({args[0]})")
+                if predicate.startswith("on(") and args:
+                    delete_effects.add(f"holding({args[0]})")
+                    extra_adds.add("empty")
+            raw_add_effects = normalize_predicate_set(sorted(set(raw_add_effects).union({normalize_predicate(item) for item in extra_adds})))
+            effect_source = "post_state_with_derived_deletes"
+            raw_delete_effects = normalize_predicate_set(sorted(delete_effects))
+        consistency = apply_state_consistency_rules(
+            previous_state_predicates=previous_state,
+            add_effects=raw_add_effects,
+            delete_effects=raw_delete_effects,
+            selected_action_candidate=selected_action_candidate,
+            role_bindings=role_bindings,
+        )
+        add_effects = normalize_predicate_set(consistency["final_add_effects"])
+        delete_effects = normalize_predicate_set(consistency["final_delete_effects"])
+        next_state = set(current_state)
+        for predicate in delete_effects:
+            predicate = normalize_predicate(predicate)
+            if predicate == "holding(*)":
+                next_state = {item for item in next_state if not item.startswith("holding(")}
+            else:
+                next_state.discard(predicate)
+        next_state.update(add_effects)
+        return {
+            "previous_state_predicates": previous_state,
+            "raw_add_effects": list(raw_add_effects),
+            "raw_delete_effects": list(raw_delete_effects),
+            "add_effects": add_effects,
+            "delete_effects": delete_effects,
+            "consistency_adds": list(consistency["consistency_adds"]),
+            "consistency_deletes": list(consistency["consistency_deletes"]),
+            "consistency_rules_applied": list(consistency["consistency_rules_applied"]),
+            "new_state_predicates": normalize_predicate_set(sorted(next_state)),
+            "normalized_new_state_predicates": normalize_predicate_set(sorted(next_state)),
+            "effect_source": effect_source,
+        }
+
+
+def _extract_ids_from_predicate(predicate: str) -> list[str]:
+    match = re.search(r"\((.*)\)", str(predicate))
+    if not match:
+        return []
+    return [item.strip() for item in match.group(1).split(",") if item.strip()]
+
+
+def _workspace_dir(cli_workspace_dir: str | None = None) -> Path:
+    if cli_workspace_dir:
+        return Path(cli_workspace_dir).resolve()
+    env_dir = os.environ.get("TONGSIM_WORKSPACE_DIR")
+    if env_dir:
+        return Path(env_dir).resolve()
+    return Path.cwd().resolve()
+
+
+def _task_json_path(workspace_dir: Path) -> Path:
+    workspace_dir = Path(workspace_dir)
+    if workspace_dir.is_file():
+        return workspace_dir
+    for name in ("task.json", "graph.json"):
+        path = workspace_dir / name
+        if path.exists():
+            return path
+    candidates = [
+        path
+        for path in sorted(workspace_dir.glob("*.json"))
+        if path.name not in {"env_state.json", "score.json", "usage.json", "decision_summary.json"}
+    ]
+    preferred = [path for path in candidates if "task" in path.stem.lower() or "graph" in path.stem.lower()]
+    if len(preferred) == 1:
+        return preferred[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    raise FileNotFoundError(f"No task.json/graph.json or unique task-like json found in {workspace_dir}")
+
+
+def _load_task(workspace_dir: Path) -> dict[str, Any]:
+    with _task_json_path(workspace_dir).open("r", encoding="utf-8") as handle:
+        task = json.load(handle)
+    if "goal_state" not in task and "final_state" in task:
+        task["goal_state"] = task["final_state"]
+    return task
+
+
+def _normalize_state(value: Any) -> list[str]:
+    return normalize_predicate_set(value)
+
+
+def _nodes_by_id(task: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(node.get("id", "")): node for node in task.get("nodes", [])}
+
+
+def _goal_nodes(task: dict[str, Any]) -> set[str]:
+    return {str(item) for item in task.get("goal_nodes", [])}
+
+
+def _initial_node_id(task: dict[str, Any]) -> str:
+    initial_state = _normalize_state(task.get("initial_state"))
+    nodes = list(task.get("nodes", []))
+    for node in nodes:
+        if _normalize_state(node.get("state")) == initial_state:
+            return str(node.get("id", ""))
+    depth_zero = [
+        str(node.get("id", ""))
+        for node in nodes
+        if isinstance(node, dict) and int(node.get("depth", 0)) == 0 and str(node.get("id", "")).strip()
+    ]
+    if depth_zero:
+        return sorted(depth_zero)[0]
+    for node in nodes:
+        node_id = str(node.get("id", "")).strip()
+        if node_id:
+            return node_id
+    raise ValueError("Task has no initial node")
+
+
+def _candidate_actions(task: dict[str, Any], node_id: str) -> list[dict[str, str]]:
+    actions: list[dict[str, str]] = []
+    for edge in task.get("dag_edges", []):
+        if str(edge.get("from", "")) != node_id:
+            continue
+        actions.append(
+            {
+                "action_id": str(edge.get("action", "")),
+                "source": str(edge.get("source", "")),
+                "to_state": str(edge.get("to", "")),
+                "text": str(edge.get("action", "")),
+                "type": str(edge.get("type", "transition")),
+            }
+        )
+    return actions
+
+
+def _outgoing_edges(task: dict[str, Any], node_id: str) -> list[dict[str, Any]]:
+    return [edge for edge in task.get("dag_edges", []) if str(edge.get("from", "")) == node_id]
+
+
+def _image_paths(workspace_dir: Path, state_id: str) -> list[str]:
+    observations_dir = workspace_dir / "observations"
+    if not observations_dir.exists():
+        return []
+
+    matches: list[Path] = []
+    direct = [
+        observations_dir / f"{state_id}.png",
+        observations_dir / f"{state_id}.jpg",
+        observations_dir / f"{state_id}.jpeg",
+    ]
+    nested = [
+        observations_dir / state_id / "front.png",
+        observations_dir / state_id / "left.png",
+        observations_dir / state_id / "right.png",
+        observations_dir / state_id / "top.png",
+    ]
+    matches.extend(path for path in direct if path.exists())
+    matches.extend(path for path in nested if path.exists())
+    nested_dir = observations_dir / state_id
+    if nested_dir.is_dir():
+        for pattern in ("*.png", "*.jpg", "*.jpeg"):
+            matches.extend(sorted(nested_dir.glob(pattern)))
+
+    seen: set[str] = set()
+    output: list[str] = []
+    for path in matches:
+        resolved = str(path.resolve())
+        if resolved not in seen:
+            seen.add(resolved)
+            output.append(resolved)
+    return output
+
+
+def _is_goal(task: dict[str, Any], node: dict[str, Any]) -> bool:
+    state = set(_normalize_state(node.get("state")))
+    goal_state = set(_normalize_state(task.get("goal_state")))
+    return (
+        str(node.get("id", "")) in _goal_nodes(task)
+        or bool(node.get("is_goal", False))
+        or goal_state.issubset(state)
+    )
+
+
+def _env_state_path(workspace_dir: Path) -> Path:
+    return workspace_dir / "env_state.json"
+
+
+def _trace_jsonl_path(workspace_dir: Path) -> Path:
+    return workspace_dir / "trace.jsonl"
+
+
+def _results_dir(workspace_dir: Path) -> Path:
+    return workspace_dir / "results"
+
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_template_path(cli_path: str | None, env_name: str, default_relative: str) -> Path:
+    if cli_path:
+        return Path(cli_path).resolve()
+    env_value = os.environ.get(env_name)
+    if env_value:
+        return Path(env_value).resolve()
+    return Path(default_relative).resolve()
+
+
+def _instantiate_library_action_to_canonical_action(
+    action_level: str | None,
+    template_id: str | None,
+    action_type: str | None,
+    role_bindings: dict[str, str],
+) -> str | None:
+    if not template_id or not action_type:
+        return None
+    if action_level == "subtask":
+        if action_type == "acquire" and role_bindings.get("r1"):
+            return f"acquire_{{object}}__{role_bindings['r1']}"
+        if action_type == "acquire_and_clean" and role_bindings.get("r1"):
+            return f"acquire_and_clean_{{object}}__{role_bindings['r1']}"
+        if action_type == "reach" and role_bindings.get("r1"):
+            return f"reach_{{object}}__{role_bindings['r1']}"
+        if action_type in {"place", "place_on"} and role_bindings.get("r1") and role_bindings.get("r2"):
+            return f"place_{role_bindings['r1']}_on_{role_bindings['r2']}"
+    if action_level == "atomic":
+        if template_id == "look_at_{object}" and role_bindings.get("object"):
+            return f"look_at_{role_bindings['object']}"
+        if template_id == "walk_to_{object}" and role_bindings.get("object"):
+            return f"walk_to_{role_bindings['object']}"
+        if template_id == "pick_up_{object}" and role_bindings.get("object"):
+            return f"pick_up_{role_bindings['object']}"
+        if template_id == "wash_{object}" and role_bindings.get("object"):
+            return f"wash_{role_bindings['object']}"
+        if template_id == "place_{object1}_on_{object2}" and role_bindings.get("object1") and role_bindings.get("object2"):
+            return f"place_{role_bindings['object1']}_on_{role_bindings['object2']}"
+    return None
+
+
+def _find_model_action_candidate(
+    candidates: list[dict[str, Any]],
+    action_level: str | None,
+    template_id: str | None,
+    action_type: str | None,
+) -> dict[str, Any] | None:
+    for candidate in candidates:
+        if (
+            str(candidate.get("action_level", "")) == str(action_level or "")
+            and str(candidate.get("template_id", "")) == str(template_id or "")
+            and str(candidate.get("action_type", "")) == str(action_type or "")
+        ):
+            return candidate
+    return None
+
+
+def _align_state_to_dag_node(
+    task: dict[str, Any],
+    new_state_predicates: list[str],
+    previous_depth: int,
+) -> tuple[dict[str, Any] | None, str]:
+    new_state_set = set(new_state_predicates)
+    exact_matches = [
+        node for node in task.get("nodes", [])
+        if set(_normalize_state(node.get("state"))) == new_state_set
+    ]
+    if exact_matches:
+        preferred = [node for node in exact_matches if int(node.get("depth", 0)) >= previous_depth]
+        chosen_pool = preferred or exact_matches
+        chosen_pool.sort(key=lambda node: (int(node.get("depth", 0)), str(node.get("id", ""))))
+        return chosen_pool[0], "exact_state_match"
+    if set(_normalize_state(task.get("goal_state"))).issubset(new_state_set):
+        goal_matches = [
+            node for node in task.get("nodes", [])
+            if str(node.get("id", "")) in _goal_nodes(task) or bool(node.get("is_goal", False))
+        ]
+        if goal_matches:
+            goal_matches.sort(key=lambda node: (int(node.get("depth", 0)), str(node.get("id", ""))))
+            return goal_matches[0], "exact_state_match"
+    return None, "virtual_state_created"
+
+
+def _diagnose_dag_alignment(task: dict[str, Any], current_node_id: str, canonical_action: str | None) -> dict[str, Any]:
+    if not canonical_action:
+        return {"status": "not_checked", "canonical_action": None, "matched_edge_to_state": None, "render_node_id": None}
+    for edge in _outgoing_edges(task, current_node_id):
+        if str(edge.get("action", "")) == canonical_action:
+            render_node_id = str(edge.get("to", ""))
+            return {"status": "matched_reference_edge", "canonical_action": canonical_action, "matched_edge_to_state": render_node_id, "render_node_id": render_node_id}
+    return {"status": "no_matching_reference_edge", "canonical_action": canonical_action, "matched_edge_to_state": None, "render_node_id": None}
+
+
+def _load_env_state(workspace_dir: Path, task: dict[str, Any]) -> dict[str, Any]:
+    state_path = _env_state_path(workspace_dir)
+    nodes = _nodes_by_id(task)
+    if state_path.exists():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["current_state_predicates"] = _normalize_state(state.get("current_state_predicates", []))
+        if state.get("render_node_id") is None:
+            state["render_node_id"] = state.get("current_state_id")
+    else:
+        max_steps = int(os.environ.get("TONGSIM_MAX_STEPS", task.get("max_steps", 30)))
+        node_id = _initial_node_id(task)
+        node = nodes[node_id]
+        state = {
+            "current_state_id": node_id,
+            "render_node_id": node_id,
+            "current_depth": int(node.get("depth", 0)),
+            "is_virtual_state": False,
+            "reached_goal": _is_goal(task, node),
+            "done": _is_goal(task, node),
+            "step_count": 0,
+            "invalid_action_count": 0,
+            "max_steps": max_steps,
+            "current_state_predicates": _normalize_state(node.get("state")),
+            "image_paths": _image_paths(workspace_dir, node_id),
+            "observation_status": "rendered_node_observation",
+            "observation_warning": None,
+            "previous_invalid_action_report": None,
+            "previous_action_report": None,
+        }
+        _save_env_state(workspace_dir, state)
+    return state
+
+
+def _save_env_state(workspace_dir: Path, state: dict[str, Any]) -> None:
+    _env_state_path(workspace_dir).write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _append_trace(workspace_dir: Path, entry: dict[str, Any]) -> None:
+    trace_path = _trace_jsonl_path(workspace_dir)
+    with trace_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry) + "\n")
+
+
+def _observe_payload(workspace_dir: Path, task: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    nodes = _nodes_by_id(task)
+    current_state_id = str(state["current_state_id"])
+    render_node_id = str(state.get("render_node_id") or current_state_id)
+    render_node = nodes.get(render_node_id)
+    state_predicates = _normalize_state(state.get("current_state_predicates", []))
+    current_depth = int(state.get("current_depth", 0))
+    image_paths = list(state.get("image_paths", []))
+    observation_status = state.get("observation_status", "rendered_node_observation")
+    observation_warning = state.get("observation_warning")
+    is_virtual_state = bool(state.get("is_virtual_state", False))
+    if render_node is not None and not is_virtual_state:
+        current_depth = int(state.get("current_depth", render_node.get("depth", current_depth)))
+        image_paths = _image_paths(workspace_dir, str(render_node.get("id", "")))
+        observation_status = "rendered_node_observation"
+        observation_warning = None
+    elif is_virtual_state:
+        image_paths = []
+        observation_status = "virtual_state_no_rendered_observation"
+        observation_warning = "The symbolic state has no matching rendered DAG node image."
+    candidate_actions = _candidate_actions(task, current_state_id) if nodes.get(current_state_id) is not None else []
+    payload = {
+        "task_instruction": str(task.get("description", "")),
+        "current_state_id": current_state_id,
+        "render_node_id": render_node_id if render_node is not None and not is_virtual_state else None,
+        "current_depth": current_depth,
+        "is_virtual_state": is_virtual_state,
+        "state_predicates": state_predicates,
+        "normalized_current_state_predicates": list(state_predicates),
+        "image_paths": image_paths,
+        "observation_status": observation_status,
+        "observation_warning": observation_warning,
+        "candidate_actions": candidate_actions,
+        "goal_state": _normalize_state(task.get("goal_state")),
+        "normalized_goal_state": _normalize_state(task.get("goal_state")),
+        "done": bool(state.get("done", False)),
+    }
+    return payload
+
+
+def _observe_payload_with_interface(
+    workspace_dir: Path,
+    task: dict[str, Any],
+    state: dict[str, Any],
+    action_interface: str,
+    debug_expose_valid_bindings: bool,
+    action_library_mode: str = "atomic_only",
+    atomic_template_path: str | None = None,
+    subtask_template_path: str | None = None,
+) -> dict[str, Any]:
+    payload = _observe_payload(workspace_dir, task, state)
+    if action_interface == "full_action":
+        payload["action_interface"] = "full_action"
+        return payload
+
+    current_state = payload["current_state_id"]
+    outgoing_edges = _outgoing_edges(task, current_state)
+    object_choices = build_object_choices(task, payload["state_predicates"])
+    base_payload = {
+        "task_instruction": payload["task_instruction"],
+        "current_state_id": payload["current_state_id"],
+        "render_node_id": payload.get("render_node_id"),
+        "current_depth": payload["current_depth"],
+        "is_virtual_state": payload.get("is_virtual_state", False),
+        "state_predicates": payload["state_predicates"],
+        "normalized_current_state_predicates": payload.get("normalized_current_state_predicates", payload["state_predicates"]),
+        "image_paths": payload["image_paths"],
+        "observation_status": payload.get("observation_status"),
+        "observation_warning": payload.get("observation_warning"),
+        "object_choices": object_choices,
+        "goal_state": payload["goal_state"],
+        "normalized_goal_state": payload.get("normalized_goal_state", payload["goal_state"]),
+        "done": payload["done"],
+    }
+    if action_interface == "factorized":
+        factorized = factorize_outgoing_edges(outgoing_edges)
+        factorized_payload = dict(base_payload)
+        factorized_payload.update(
+            {
+                "action_interface": "factorized",
+                "action_types": factorized["action_types"],
+                "previous_invalid_action_report": state.get("previous_invalid_action_report"),
+            }
+        )
+        if debug_expose_valid_bindings:
+            factorized_payload["candidate_actions"] = payload["candidate_actions"]
+            factorized_payload["valid_bindings"] = factorized["valid_bindings_internal"]
+        return factorized_payload
+
+    if action_interface == "library_factorized":
+        atomic_library = load_atomic_templates(_resolve_template_path(atomic_template_path, "TONGSIM_ATOMIC_TEMPLATE_PATH", "tests/fixtures/atomic_templates.json"))
+        subtask_library = load_subtask_templates(_resolve_template_path(subtask_template_path, "TONGSIM_SUBTASK_TEMPLATE_PATH", "tests/fixtures/subtask_templates.json"))
+        library_payload = dict(base_payload)
+        library_payload.update(
+            {
+                "action_interface": "library_factorized",
+                "action_library_mode": action_library_mode,
+                "model_facing_action_candidates": build_model_facing_action_candidates(
+                    task,
+                    payload["state_predicates"],
+                    action_library_mode,
+                    atomic_library,
+                    subtask_library,
+                ),
+                "model_facing_object_candidates": build_task_object_candidates(task, payload["state_predicates"]),
+                "previous_action_report": state.get("previous_action_report"),
+            }
+        )
+        if debug_expose_valid_bindings:
+            library_payload["candidate_actions"] = payload["candidate_actions"]
+            library_payload["current_valid_dag_actions"] = payload["candidate_actions"]
+        return library_payload
+
+    global_payload = dict(base_payload)
+    global_payload.update(
+        {
+            "action_interface": "global_factorized",
+            "action_types": build_global_action_types(task),
+            "previous_action_report": state.get("previous_action_report"),
+        }
+    )
+    if debug_expose_valid_bindings:
+        factorized = factorize_outgoing_edges(outgoing_edges)
+        global_payload["candidate_actions"] = payload["candidate_actions"]
+        global_payload["valid_bindings"] = factorized["valid_bindings_internal"]
+    return global_payload
+
+
+def find_matching_transition(
+    current_node_id: str,
+    action_type: str,
+    object_id: str | None,
+    target_id: str | None,
+    task: dict[str, Any],
+) -> dict[str, Any] | None:
+    outgoing_edges = _outgoing_edges(task, current_node_id)
+    factorized = factorize_outgoing_edges(outgoing_edges)
+    normalized_target_id = target_id
+    normalized_object_id = object_id
+    if action_type == "reach" and normalized_target_id is None and normalized_object_id is not None:
+        normalized_target_id = normalized_object_id
+        normalized_object_id = None
+    for edge, binding in zip(outgoing_edges, factorized["valid_bindings_internal"]):
+        if binding["action_type"] != action_type:
+            continue
+        if binding["object_id"] is not None and binding["object_id"] != normalized_object_id:
+            continue
+        if binding["target_id"] is not None and binding["target_id"] != normalized_target_id:
+            continue
+        return edge
+    return None
+
+
+def _task_object_ids(task: dict[str, Any]) -> list[str]:
+    object_ids: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: Any) -> None:
+        normalized = str(value).strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            object_ids.append(normalized)
+
+    task_scope = task.get("task_scope")
+    if isinstance(task_scope, list):
+        for item in task_scope:
+            _add(item)
+
+    for state_key in ("initial_state", "goal_state", "final_state"):
+        for predicate in _normalize_state(task.get(state_key)):
+            for object_id in _extract_ids_from_predicate(predicate):
+                _add(object_id)
+
+    for node in task.get("nodes", []):
+        for predicate in _normalize_state(node.get("state")):
+            for object_id in _extract_ids_from_predicate(predicate):
+                _add(object_id)
+
+    bindings_sources = []
+    for state_key in ("initial_state", "final_state"):
+        state_value = task.get(state_key)
+        if isinstance(state_value, dict) and isinstance(state_value.get("bindings"), dict):
+            bindings_sources.append(state_value.get("bindings", {}))
+    for bindings in bindings_sources:
+        for object_id in bindings.values():
+            _add(object_id)
+
+    return object_ids
+
+
+def _available_objects_and_targets(task: dict[str, Any], current_state_predicates: list[str]) -> tuple[list[str], list[str]]:
+    object_choices = build_object_choices(task, current_state_predicates)
+    object_ids = sorted({str(item["object_id"]) for item in object_choices})
+    return object_ids, list(object_ids)
+
+
+def _build_factorized_current_valid_report(
+    task: dict[str, Any],
+    current_id: str,
+    current_depth: int,
+    current_state_predicates: list[str],
+    action_type: str | None,
+    object_id: str | None,
+    target_id: str | None,
+) -> dict[str, Any]:
+    outgoing_edges = _outgoing_edges(task, current_id)
+    factorized = factorize_outgoing_edges(outgoing_edges)
+    bindings = factorized["valid_bindings_internal"]
+    available_action_types = sorted({binding["action_type"] for binding in bindings if binding["action_type"]})
+    available_objects = sorted(
+        {
+            binding["object_id"]
+            for binding in bindings
+            if binding.get("object_id")
+        }
+    )
+    available_targets = sorted(
+        {
+            binding["target_id"]
+            for binding in bindings
+            if binding.get("target_id")
+        }
+    )
+    requirements = {
+        item["action_type"]: list(item.get("required_args", []))
+        for item in factorized["action_types"]
+    }
+    normalized_target_id = target_id
+    if action_type == "reach" and normalized_target_id is None and object_id is not None:
+        normalized_target_id = object_id
+
+    violations: list[dict[str, str]] = []
+    reason = "The selected factorized action could not be executed in the current state."
+    if not action_type or action_type not in available_action_types:
+        violations.append(
+            {
+                "type": "action_type_not_executable_now",
+                "message": "The chosen action_type is not currently executable in this state.",
+            }
+        )
+        reason = "The selected action_type is not executable in the current state."
+    else:
+        required_args = requirements.get(action_type, [])
+        if "object_id" in required_args and not object_id:
+            violations.append(
+                {
+                    "type": "missing_required_argument",
+                    "message": f"The action_type {action_type} requires object_id.",
+                }
+            )
+            reason = "A required object argument was missing."
+        if "target_id" in required_args and not normalized_target_id:
+            violations.append(
+                {
+                    "type": "missing_required_argument",
+                    "message": f"The action_type {action_type} requires target_id.",
